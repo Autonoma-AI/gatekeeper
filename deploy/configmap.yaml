@@ -1,0 +1,13 @@
+# Host -> upstream map. The previewkit deployer generates this from the env's apps;
+# the keys are the per-app HMAC preview hostnames.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gatekeeper-routes
+  namespace: preview-example
+data:
+  routes.json: |
+    {
+      "a1b2c3d4e5f6.preview.autonoma.app": { "service": "web", "port": 3000 },
+      "b2c3d4e5f6a1.preview.autonoma.app": { "service": "api", "port": 8080 }
+    }

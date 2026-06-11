@@ -1,0 +1,9 @@
+.git
+.github
+bin
+out
+deploy
+*.md
+Makefile
+.gitignore
+.dockerignore
