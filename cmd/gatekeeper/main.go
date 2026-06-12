@@ -52,8 +52,10 @@ func run() error {
 	log.Info("starting gatekeeper",
 		"namespace", cfg.Namespace,
 		"port", cfg.Port,
+		"authEnabled", cfg.AuthEnabled(),
 		"idleTimeout", cfg.IdleTimeout.String(),
 		"wakeTimeout", cfg.WakeTimeout.String(),
+		"targetSelector", cfg.TargetSelector,
 		"routes", len(cfg.Routes),
 	)
 
@@ -68,9 +70,9 @@ func run() error {
 
 	// Wire components.
 	table := routing.NewTable(cfg.Namespace, cfg.Routes)
-	gate := auth.NewGate(cfg.BypassToken, cfg.AppURL)
-	authPage := auth.PreviewAuthPage(cfg.CookieDomain)
-	sc := scaler.New(clientset, cfg.Namespace, cfg.ManagedLabelSelector, cfg.SelfAppLabel, log)
+	gate := auth.NewGate(cfg.AuthToken, cfg.AuthHeader, cfg.AuthCookie, cfg.LoginURL)
+	callbackHTML := auth.AuthCallbackPage(cfg.AuthCookie, cfg.CookieDomain)
+	sc := scaler.New(clientset, cfg.Namespace, cfg.TargetSelector, cfg.SelfName, cfg.WakeReplicasAnnotation, log)
 	pw := power.New(sc, cfg.WakeTimeout, log)
 	tracker := activity.NewTracker()
 
@@ -86,7 +88,7 @@ func run() error {
 	}
 	cancelInit()
 
-	handler := proxy.NewHandler(table, gate, pw, sc, tracker, authPage, cfg.HealthPath, cfg.WakeTimeout, log)
+	handler := proxy.NewHandler(table, gate, pw, sc, tracker, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.WakeTimeout, log)
 
 	loop := idle.New(tracker, pw, cfg.IdleTimeout, cfg.IdleCheckInterval, log)
 	go loop.Run(ctx)

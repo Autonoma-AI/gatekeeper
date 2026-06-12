@@ -3,65 +3,69 @@ package auth
 import (
 	"net/http"
 	"net/http/httptest"
-	"net/url"
+	"strings"
 	"testing"
 )
 
-const testToken = "abc123deadbeef"
+const (
+	testToken  = "abc123deadbeef"
+	testHeader = "X-Gatekeeper-Token"
+	testCookie = "gatekeeper_session"
+)
+
+func TestGateDisabledWhenNoToken(t *testing.T) {
+	g := NewGate("", testHeader, testCookie, "")
+	if g.Enabled() {
+		t.Fatal("expected gate disabled with empty token")
+	}
+	r := httptest.NewRequest(http.MethodGet, "http://x/", nil)
+	if !g.Authorized(r) {
+		t.Fatal("a disabled gate must authorize all requests")
+	}
+}
 
 func TestGateAuthorized(t *testing.T) {
-	gate := NewGate(testToken, "https://app.example.com")
-
+	g := NewGate(testToken, testHeader, testCookie, "")
 	tests := []struct {
 		name   string
 		mutate func(*http.Request)
 		want   bool
 	}{
-		{
-			name:   "valid bypass header",
-			mutate: func(r *http.Request) { r.Header.Set("X-Previewkit-Bypass", testToken) },
-			want:   true,
-		},
-		{
-			name:   "valid session cookie",
-			mutate: func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "pk_session", Value: testToken}) },
-			want:   true,
-		},
-		{
-			name:   "wrong header token",
-			mutate: func(r *http.Request) { r.Header.Set("X-Previewkit-Bypass", "nope") },
-			want:   false,
-		},
-		{
-			name:   "wrong cookie token",
-			mutate: func(r *http.Request) { r.AddCookie(&http.Cookie{Name: "pk_session", Value: "nope"}) },
-			want:   false,
-		},
-		{
-			name:   "no credentials",
-			mutate: func(r *http.Request) {},
-			want:   false,
-		},
+		{"valid header", func(r *http.Request) { r.Header.Set(testHeader, testToken) }, true},
+		{"valid cookie", func(r *http.Request) { r.AddCookie(&http.Cookie{Name: testCookie, Value: testToken}) }, true},
+		{"wrong header", func(r *http.Request) { r.Header.Set(testHeader, "nope") }, false},
+		{"wrong cookie", func(r *http.Request) { r.AddCookie(&http.Cookie{Name: testCookie, Value: "nope"}) }, false},
+		{"no creds", func(r *http.Request) {}, false},
 	}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := httptest.NewRequest(http.MethodGet, "http://x.preview.test/", nil)
+			r := httptest.NewRequest(http.MethodGet, "http://x/", nil)
 			tt.mutate(r)
-			if got := gate.Authorized(r); got != tt.want {
+			if got := g.Authorized(r); got != tt.want {
 				t.Fatalf("Authorized() = %v, want %v", got, tt.want)
 			}
 		})
 	}
 }
 
-func TestGateRedirectLocation(t *testing.T) {
-	gate := NewGate(testToken, "https://app.example.com")
-	got := gate.RedirectLocation("abc.preview.test", "/foo?bar=1")
-
-	want := "https://app.example.com/preview-auth?redirect=" +
-		url.QueryEscape("https://abc.preview.test/foo?bar=1")
-	if got != want {
-		t.Fatalf("RedirectLocation() =\n  %q\nwant\n  %q", got, want)
-	}
+func TestGateLoginRedirect(t *testing.T) {
+	t.Run("with login url", func(t *testing.T) {
+		g := NewGate(testToken, testHeader, testCookie, "https://login.example.com")
+		loc, ok := g.LoginRedirect("https", "abc.example.test", "/foo?bar=1")
+		if !ok {
+			t.Fatal("expected redirect when login URL is set")
+		}
+		if !strings.HasPrefix(loc, "https://login.example.com?redirect=") {
+			t.Fatalf("unexpected location %q", loc)
+		}
+		if !strings.Contains(loc, "https%3A%2F%2Fabc.example.test%2Ffoo%3Fbar%3D1") {
+			t.Fatalf("redirect target not URL-encoded in %q", loc)
+		}
+	})
+	t.Run("without login url", func(t *testing.T) {
+		g := NewGate(testToken, testHeader, testCookie, "")
+		if _, ok := g.LoginRedirect("https", "h", "/"); ok {
+			t.Fatal("expected no redirect when login URL is unset")
+		}
+	})
 }

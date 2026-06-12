@@ -1,7 +1,7 @@
-// Package proxy is Gatekeeper's HTTP surface: it authenticates each request,
-// records activity, wakes the namespace and holds the request when asleep, then
-// reverse-proxies to the in-cluster app Service. Websocket upgrades are handled
-// transparently by httputil.ReverseProxy after the auth gate runs.
+// Package proxy is Gatekeeper's HTTP surface: it (optionally) authenticates each
+// request, records activity, wakes the namespace and holds the request when
+// asleep, then reverse-proxies to the in-cluster upstream Service. Websocket
+// upgrades are handled transparently by httputil.ReverseProxy after the gate runs.
 package proxy
 
 import (
@@ -21,8 +21,6 @@ import (
 	"github.com/autonoma-ai/gatekeeper/internal/routing"
 )
 
-const previewAuthPath = "/preview-auth"
-
 // Waker is the power-management surface the handler needs.
 type Waker interface {
 	Asleep() bool
@@ -39,14 +37,15 @@ type Toucher interface {
 	Touch()
 }
 
-// Handler implements http.Handler for all preview traffic in one namespace.
+// Handler implements http.Handler for all traffic in one namespace.
 type Handler struct {
 	routes       *routing.Table
 	gate         *auth.Gate
 	power        Waker
 	readiness    ReadinessWaiter
 	tracker      Toucher
-	authPageHTML string
+	callbackHTML string
+	callbackPath string
 	healthPath   string
 	wakeTimeout  time.Duration
 	proxy        *httputil.ReverseProxy
@@ -62,7 +61,8 @@ func NewHandler(
 	pw Waker,
 	readiness ReadinessWaiter,
 	tracker Toucher,
-	authPageHTML string,
+	callbackHTML string,
+	callbackPath string,
 	healthPath string,
 	wakeTimeout time.Duration,
 	log *slog.Logger,
@@ -74,7 +74,8 @@ func NewHandler(
 		power:        pw,
 		readiness:    readiness,
 		tracker:      tracker,
-		authPageHTML: authPageHTML,
+		callbackHTML: callbackHTML,
+		callbackPath: callbackPath,
 		healthPath:   healthPath,
 		wakeTimeout:  wakeTimeout,
 		proxy:        newReverseProxy(transport, log),
@@ -91,12 +92,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2. Cookie-setter page - unauthenticated (it is how the cookie gets set).
-	if r.URL.Path == previewAuthPath {
+	// 2. Auth callback page - unauthenticated (it is how the cookie gets set).
+	if r.URL.Path == h.callbackPath {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, h.authPageHTML)
+		_, _ = io.WriteString(w, h.callbackHTML)
 		return
 	}
 
@@ -104,13 +105,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	upstream, ok := h.routes.Resolve(r.Host)
 	if !ok {
 		h.log.Warn("no route for host", "host", r.Host)
-		http.Error(w, "Unknown preview host", http.StatusNotFound)
+		http.Error(w, "Unknown host", http.StatusNotFound)
 		return
 	}
 
-	// 4. Auth gate: bounce unauthenticated browsers to the login page.
+	// 4. Auth gate (a no-op when authentication is disabled): redirect browsers to
+	//    the login URL if one is configured, otherwise reject with 401.
 	if !h.gate.Authorized(r) {
-		http.Redirect(w, r, h.gate.RedirectLocation(r.Host, r.URL.RequestURI()), http.StatusFound)
+		if loc, redirect := h.gate.LoginRedirect(requestScheme(r), r.Host, r.URL.RequestURI()); redirect {
+			http.Redirect(w, r, loc, http.StatusFound)
+		} else {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		}
 		return
 	}
 
@@ -122,7 +128,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err := h.wakeAndWait(r.Context(), upstream.Service); err != nil {
 			h.log.Error("wake failed", "host", r.Host, "service", upstream.Service, "err", err)
 			w.Header().Set("Retry-After", "5")
-			http.Error(w, "Preview environment is waking up, please retry shortly.", http.StatusServiceUnavailable)
+			http.Error(w, "Service is waking up, please retry shortly.", http.StatusServiceUnavailable)
 			return
 		}
 	}
@@ -149,6 +155,19 @@ func (h *Handler) wakeAndWait(ctx context.Context, service string) error {
 	return nil
 }
 
+// requestScheme derives the public scheme of the original request: an upstream
+// X-Forwarded-Proto wins (TLS is usually terminated before Gatekeeper), then
+// direct TLS, else http.
+func requestScheme(r *http.Request) string {
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		return proto
+	}
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
 // ctxKey is an unexported context key type for stashing the resolved target.
 type ctxKey int
 
@@ -164,11 +183,11 @@ func newReverseProxy(transport http.RoundTripper, log *slog.Logger) *httputil.Re
 			if target, ok := pr.In.Context().Value(targetKey).(*url.URL); ok && target != nil {
 				pr.SetURL(target)
 			}
-			// Preserve the public Host the app expects; advertise https upstream
-			// (TLS is terminated at the ALB, so the inbound request is plain HTTP).
+			// Preserve the public Host the app expects and forward the original
+			// client/proto so the upstream sees a faithful request.
 			pr.Out.Host = pr.In.Host
 			pr.SetXForwarded()
-			pr.Out.Header.Set("X-Forwarded-Proto", "https")
+			pr.Out.Header.Set("X-Forwarded-Proto", requestScheme(pr.In))
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			log.Warn("upstream proxy error", "host", r.Host, "err", err)
@@ -194,7 +213,6 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if err == nil || !isDialError(err) {
 			return resp, err
 		}
-		// Dial failed (nothing listening yet); wait and retry until ctx expires.
 		select {
 		case <-req.Context().Done():
 			return nil, err

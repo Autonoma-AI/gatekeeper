@@ -1,15 +1,15 @@
 # Minimum to scale workloads and detect readiness within this namespace.
-# patch on the parent objects sets spec.replicas and the wake-replicas annotation
-# in one merge patch; endpoints is polled to know when an app is ready.
+# patch on the parent objects sets spec.replicas and the wake annotation in one
+# merge patch; endpointslices are polled to know when an upstream is ready.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: gatekeeper
-  namespace: preview-example
+  namespace: gatekeeper
 rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "patch"]
-  - apiGroups: [""]
-    resources: ["endpoints", "pods"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
     verbs: ["get", "list"]

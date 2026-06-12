@@ -1,0 +1,187 @@
+# End-to-end harness for a local cluster (OrbStack / kind / docker-desktop).
+# A sample "app" (traefik/whoami) plus a full Gatekeeper install in one namespace.
+# Idle/wake timers are deliberately short so the sleep/wake cycle is observable.
+#
+# Apply with `e2e/run.sh` (builds the image + runs assertions), or by hand:
+#   kubectl --context orbstack apply -f e2e/e2e.yaml
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gatekeeper-e2e
+---
+# Sample app Gatekeeper will scale. It opts in via the default target label.
+# whoami echoes the request (headers, host), which lets us assert the proxy
+# preserves Host and sets X-Forwarded-Proto.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+  namespace: gatekeeper-e2e
+  labels:
+    app: whoami
+    gatekeeper.dev/scale-to-zero: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whoami
+  template:
+    metadata:
+      labels:
+        app: whoami
+        gatekeeper.dev/scale-to-zero: "true"
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:latest
+          args: ["--port=80"]
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: gatekeeper-e2e
+  labels:
+    app: whoami
+spec:
+  type: ClusterIP
+  selector:
+    app: whoami
+  ports:
+    - port: 80
+      targetPort: 80
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-e2e
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-e2e
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-e2e
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gatekeeper
+subjects:
+  - kind: ServiceAccount
+    name: gatekeeper
+    namespace: gatekeeper-e2e
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gatekeeper-routes
+  namespace: gatekeeper-e2e
+data:
+  routes.json: |
+    { "whoami.example.test": { "service": "whoami", "port": 80 } }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-e2e
+  labels:
+    app: gatekeeper
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gatekeeper
+  template:
+    metadata:
+      labels:
+        app: gatekeeper
+    spec:
+      serviceAccountName: gatekeeper
+      containers:
+        - name: gatekeeper
+          image: gatekeeper:dev
+          imagePullPolicy: IfNotPresent # use the locally-built image (OrbStack shares the docker store)
+          ports:
+            - containerPort: 8080
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ROUTES_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: gatekeeper-routes
+                  key: routes.json
+            # Auth enabled with a redirect login so the harness can exercise the gate.
+            - name: AUTH_TOKEN
+              value: "e2e-secret-token"
+            - name: LOGIN_URL
+              value: "http://login.example.test"
+            - name: COOKIE_DOMAIN
+              value: "example.test"
+            # Short timers so the sleep/wake cycle is easy to observe in a test run.
+            - name: IDLE_TIMEOUT
+              value: "20s"
+            - name: IDLE_CHECK_INTERVAL
+              value: "5s"
+            - name: WAKE_TIMEOUT
+              value: "60s"
+            - name: LOG_LEVEL
+              value: "debug"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-e2e
+  labels:
+    app: gatekeeper
+spec:
+  type: ClusterIP
+  selector:
+    app: gatekeeper
+  ports:
+    - port: 80
+      targetPort: 8080

@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-// Tests the Rewrite logic (target selection, Host preservation, X-Forwarded-Proto)
+// Tests the Rewrite logic (target selection, Host preservation, forwarded proto)
 // against a real upstream, injecting the target the way the handler does.
 func TestReverseProxyForwardsRequestAndSetsHeaders(t *testing.T) {
 	var gotHost, gotProto, gotPath string
@@ -26,7 +26,8 @@ func TestReverseProxyForwardsRequestAndSetsHeaders(t *testing.T) {
 	}
 	p := newReverseProxy(http.DefaultTransport, testLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "http://app.preview.test/some/path", nil)
+	req := httptest.NewRequest(http.MethodGet, "http://app.example.test/some/path", nil)
+	req.Header.Set("X-Forwarded-Proto", "https") // simulate TLS terminated upstream
 	req = req.WithContext(withTarget(req.Context(), target))
 	rec := httptest.NewRecorder()
 	p.ServeHTTP(rec, req)
@@ -35,13 +36,13 @@ func TestReverseProxyForwardsRequestAndSetsHeaders(t *testing.T) {
 		t.Fatalf("status = %d, want 200", rec.Code)
 	}
 	if rec.Body.String() != "hello upstream" {
-		t.Fatalf("body = %q, want %q", rec.Body.String(), "hello upstream")
+		t.Fatalf("body = %q", rec.Body.String())
 	}
 	if gotProto != "https" {
 		t.Errorf("upstream X-Forwarded-Proto = %q, want https", gotProto)
 	}
-	if gotHost != "app.preview.test" {
-		t.Errorf("upstream Host = %q, want app.preview.test (public host preserved)", gotHost)
+	if gotHost != "app.example.test" {
+		t.Errorf("upstream Host = %q, want app.example.test (public host preserved)", gotHost)
 	}
 	if gotPath != "/some/path" {
 		t.Errorf("upstream path = %q, want /some/path", gotPath)

@@ -1,79 +1,154 @@
 # Gatekeeper
 
-A tiny per-namespace reverse proxy for Autonoma preview environments. One Gatekeeper
-pod runs in each preview namespace and replaces the old stock-nginx proxy
-(`previewkit-nginx`). It does three jobs:
+Gatekeeper is a tiny per-namespace reverse proxy for Kubernetes that **scales your
+workloads to zero when they are idle and wakes them on the next request** - holding
+that request until the backend is ready, so the caller sees a slightly slow first
+response instead of an error. It can optionally **authenticate** every request with
+a shared token.
 
-1. **Authenticates every request.** Traffic must carry the environment's bypass token,
-   either the `x-previewkit-bypass` header (service-to-service) or the `pk_session`
-   cookie (browsers). Unauthenticated browsers are redirected to the main app's
-   `/preview-auth` page, which checks org membership, issues the token, and bounces
-   back to set the cookie. Gatekeeper itself serves that cookie-setting `/preview-auth`
-   page on the preview host.
-2. **Scales the namespace to zero when idle.** It tracks the last request time; after
-   `IDLE_TIMEOUT` (default 30m) it scales every previewkit-managed Deployment and
-   StatefulSet (apps, Redis, Postgres, Mongo) to zero, saving each one's replica count
-   on a `previewkit.dev/wake-replicas` annotation. It never scales itself.
-3. **Wakes on demand and holds the request.** The next request restores every
-   workload's replica count, then holds the connection (Knative-activator style),
-   waiting for the target app's Service endpoints to become ready before proxying the
-   real response. If the wake exceeds `WAKE_TIMEOUT` (default 90s) it returns
-   `503` with `Retry-After`.
+It ships as a single ~25 MB static binary on distroless, uses tens of MB of RAM,
+starts instantly, and talks to the Kubernetes API with its own in-cluster
+ServiceAccount. Everything is configured through environment variables.
 
-It is built in Go: a static binary on distroless (~15-25MB), tens of MB of RAM, instant
-start. `net/http/httputil.ReverseProxy` handles streaming and websocket upgrades;
-`k8s.io/client-go` does the scaling via the pod's in-cluster ServiceAccount.
+## Why
 
-## How it fits in
+Idle environments (per-branch/preview/staging/demo deployments, internal tools,
+rarely-used services) burn CPU and memory around the clock. Gatekeeper sits in
+front of them and:
 
-Gatekeeper sits behind the shared ALB Gateway + ingress-nginx, one instance per preview
-namespace. The Autonoma `previewkit` deployer creates Gatekeeper's Deployment, Service,
-ServiceAccount, Role, RoleBinding, ConfigMap, and the API-server egress NetworkPolicy for
-each environment, and points the per-app Ingress at Gatekeeper's Service. The token
-issuing/login flow lives in the Autonoma app (`previewAccess.issueToken` + the
-`/preview-auth` UI route); Gatekeeper only validates the token and sets the cookie.
+- **Scales to zero** every selected Deployment and StatefulSet after an idle
+  period, remembering each one's replica count.
+- **Wakes on demand**: the next request restores those replicas, waits for the
+  target Service's endpoints to become ready, then proxies through (Knative
+  activator style). Websocket upgrades and streaming responses are supported.
+- **Optionally authenticates** requests with a shared token via a header or
+  cookie, with an optional redirect to an external login.
 
-## Configuration (environment variables)
+## How it works
 
-| Var | Default | Purpose |
-| --- | --- | --- |
-| `PORT` | `8080` | Listen port (nonroot cannot bind <1024). |
-| `NAMESPACE` | (required) | The preview namespace. Injected via the downward API. |
-| `BYPASS_TOKEN` | (required) | Plaintext per-environment token compared against the cookie/header. |
-| `COOKIE_DOMAIN` | (required) | Preview domain; the `pk_session` cookie is set on `.<domain>`. |
-| `APP_URL` | (required) | Main app origin used to build the login redirect. |
-| `ROUTES_JSON` | (required) | `{"host":{"service":"app","port":3000}, ...}` host -> upstream map. |
+```
+        +------------------------- namespace -------------------------+
+request | Gatekeeper --proxy--> Service --> Pod(s)                    |
+------> |    |                                                        |
+        |    +- auth (optional): token in header/cookie, else 401     |
+        |    +- idle > IDLE_TIMEOUT      -> scale targets to 0         |
+        |    +- request while asleep     -> restore replicas, wait,    |
+        |                                   then proxy                 |
+        +-------------------------------------------------------------+
+```
+
+Gatekeeper routes by `Host` header using a table you provide (`ROUTES_JSON`). The
+awake/asleep state is held in memory (run a single replica) and seeded from the
+cluster at startup; each workload's pre-sleep replica count is saved on an
+annotation, so a restart recovers cleanly.
+
+## Quick start
+
+1. Label the workloads you want managed (the default selector is opt-in):
+
+   ```sh
+   kubectl label deploy/my-app gatekeeper.dev/scale-to-zero=true
+   ```
+
+2. Edit `deploy/` (namespace, the `gatekeeper-routes` ConfigMap, and any env), then apply:
+
+   ```sh
+   kubectl apply -f deploy/
+   ```
+
+3. Point your Ingress / Gateway at the `gatekeeper` Service (port 80) for the
+   hostnames in your routes table.
+
+A complete, runnable example (a sample app + Gatekeeper + assertions for the full
+auth/sleep/wake cycle) lives in `e2e/`. Run it against any local cluster:
+
+```sh
+./e2e/run.sh        # uses kube context "orbstack"; override with KUBE_CONTEXT
+```
+
+## Configuration
+
+All configuration is via environment variables.
+
+### Core
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `NAMESPACE` | *(required)* | Namespace Gatekeeper manages. Inject via the downward API. |
+| `ROUTES_JSON` | *(required)* | `{"host":{"service":"svc","port":80}, ...}` host -> upstream map. |
+| `PORT` | `8080` | Listen port. |
+| `HEALTH_PATH` | `/healthz` | Unauthenticated health/probe path. |
+| `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. JSON logs to stdout. |
+
+### Scale-to-zero
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `TARGET_SELECTOR` | `gatekeeper.dev/scale-to-zero=true` | Label selector for managed Deployments/StatefulSets. Empty selects every workload in the namespace. |
+| `SELF_NAME` | `gatekeeper` | Workload name Gatekeeper never scales (itself). |
+| `WAKE_REPLICAS_ANNOTATION` | `gatekeeper.dev/wake-replicas` | Annotation storing the pre-sleep replica count. |
 | `IDLE_TIMEOUT` | `30m` | Idle duration before scaling to zero (Go duration). |
-| `IDLE_CHECK_INTERVAL` | `30s` | How often the idle loop checks. |
-| `WAKE_TIMEOUT` | `90s` | Max time to hold a request while waking. |
-| `SELF_APP_LABEL` | `gatekeeper` | `app` label value Gatekeeper excludes from scaling (itself). |
-| `MANAGED_LABEL_SELECTOR` | `previewkit.dev/managed-by=previewkit` | Selector for managed workloads. |
-| `HEALTH_PATH` | `/gatekeeper-health` | Unauthenticated readiness/liveness path. |
-| `LOG_LEVEL` | `info` | `debug`, `info`, `warn`, `error`. |
+| `IDLE_CHECK_INTERVAL` | `30s` | How often idleness is checked. |
+| `WAKE_TIMEOUT` | `90s` | Max time to hold a request while waking; then 503 + `Retry-After`. |
+
+### Authentication (optional)
+
+Authentication is **off** unless `AUTH_TOKEN` is set - Gatekeeper is then a plain
+scale-to-zero proxy. When set, every request except the health and callback paths
+must carry the token.
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `AUTH_TOKEN` | *(empty = auth off)* | Shared secret required on every request. |
+| `AUTH_HEADER` | `X-Gatekeeper-Token` | Header carrying the token. |
+| `AUTH_COOKIE` | `gatekeeper_session` | Cookie carrying the token. |
+| `LOGIN_URL` | *(empty)* | If set, unauthenticated browsers are redirected here as `?redirect=<original-url>`; if empty, they get 401. |
+| `AUTH_CALLBACK_PATH` | `/_gatekeeper/auth` | Page that reads `?token=&next=`, sets the cookie, and redirects to `next`. |
+| `COOKIE_DOMAIN` | *(empty)* | Scope the cookie to `.<domain>` (shared across subdomains); empty = host-only. |
+
+**Auth modes:**
+
+- **No auth** - leave `AUTH_TOKEN` unset.
+- **Static token** - set `AUTH_TOKEN` (and optionally `AUTH_HEADER`). Callers send
+  the header; missing/invalid gets 401. Good for service-to-service traffic or an
+  upstream gateway that injects the header.
+- **Browser login** - also set `LOGIN_URL` (and usually `COOKIE_DOMAIN`).
+  Unauthenticated browsers are sent to your login, which authenticates the user and
+  then redirects to `https://<host>{AUTH_CALLBACK_PATH}?token=<token>&next=<original>`
+  to drop the cookie. Subsequent requests carry the cookie.
 
 ## RBAC
 
-Gatekeeper needs a namespaced Role (see `deploy/role.yaml`):
+Gatekeeper runs as its own ServiceAccount and needs a namespaced Role:
 
+```yaml
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list"]
 ```
-apps: deployments, statefulsets    -> get, list, watch, patch
-"":   endpoints, pods              -> get, list
-```
 
-`patch` on the workloads sets both `spec.replicas` and the wake annotation in one merge
-patch; `endpoints` is polled for readiness.
+`patch` on the workloads sets `spec.replicas` and the wake annotation in one merge
+patch; `endpointslices` are polled for readiness. `deploy/` contains the full set
+(ServiceAccount, Role, RoleBinding).
 
-> **Network policy gotcha:** preview namespaces typically run a default-deny egress
-> policy that excludes RFC1918 ranges, which blocks the in-cluster API server. Gatekeeper
-> needs the `allow-gatekeeper-apiserver-egress` policy (`deploy/networkpolicy-apiserver-egress.yaml`)
-> or every scale call hangs.
+> If the namespace runs a default-deny egress NetworkPolicy, Gatekeeper also needs
+> egress to the Kubernetes API server (see `deploy/networkpolicy-apiserver-egress.yaml`),
+> or every scale call will hang.
 
 ## Develop
 
 ```sh
-make all        # gofmt check + vet + test + build
-make test
-make docker     # build the image
+make all      # gofmt check + vet + test + build
+make docker   # build the container image
+./e2e/run.sh  # end-to-end test on a local cluster (OrbStack / kind / docker-desktop)
 ```
 
-Standalone deploy example manifests live in `deploy/` (namespace `preview-example`).
+Go 1.26+. The module is `github.com/autonoma-ai/gatekeeper`.
+
+## License
+
+MIT - see [LICENSE](LICENSE).

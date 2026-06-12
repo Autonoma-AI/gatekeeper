@@ -1,14 +1,15 @@
-# REQUIRED when the namespace runs a default-deny egress policy that excludes
-# RFC1918 ranges (the usual preview-isolation setup). Without this, Gatekeeper
-# cannot reach the in-cluster Kubernetes API server and every scale call hangs.
+# REQUIRED only when the namespace runs a default-deny egress NetworkPolicy that
+# excludes RFC1918 ranges (a common namespace-isolation setup). Without it,
+# Gatekeeper cannot reach the in-cluster Kubernetes API server and every scale
+# call hangs.
 #
-# Scoped to the Gatekeeper pod only (app=gatekeeper), so user app pods keep their
-# strict egress. NetworkPolicies are additive whitelists.
+# Scoped to the Gatekeeper pod only (app=gatekeeper), so other pods keep their
+# egress rules unchanged. NetworkPolicies are additive whitelists.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
   name: allow-gatekeeper-apiserver-egress
-  namespace: preview-example
+  namespace: gatekeeper
 spec:
   podSelector:
     matchLabels:

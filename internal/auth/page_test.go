@@ -5,23 +5,28 @@ import (
 	"testing"
 )
 
-func TestPreviewAuthPage(t *testing.T) {
-	html := PreviewAuthPage("preview.example.com")
-
-	mustContain := []string{
-		"pk_session",
-		"domain=.preview.example.com",
+func TestAuthCallbackPageWithDomain(t *testing.T) {
+	html := AuthCallbackPage("gatekeeper_session", "example.com")
+	for _, frag := range []string{
+		`document.cookie="gatekeeper_session="`,
+		"domain=.example.com",
 		"max-age=86400",
 		"secure",
 		"samesite=lax",
 		"encodeURIComponent",
 		"location.replace",
-		`p.get("session")`,
+		`p.get("token")`,
 		`p.get("next")`,
-	}
-	for _, frag := range mustContain {
+	} {
 		if !strings.Contains(html, frag) {
-			t.Errorf("preview-auth page missing %q\n---\n%s", frag, html)
+			t.Errorf("callback page missing %q\n%s", frag, html)
 		}
+	}
+}
+
+func TestAuthCallbackPageHostOnlyWhenNoDomain(t *testing.T) {
+	html := AuthCallbackPage("sess", "")
+	if strings.Contains(html, "domain=") {
+		t.Errorf("expected a host-only cookie (no domain attribute), got:\n%s", html)
 	}
 }

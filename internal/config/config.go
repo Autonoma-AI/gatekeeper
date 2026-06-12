@@ -1,6 +1,6 @@
 // Package config loads and validates Gatekeeper's runtime configuration from
-// the environment. All configuration is read once at startup; the rest of the
-// program receives values, never the environment.
+// the environment. Everything is read once at startup; the rest of the program
+// receives values, never the environment.
 package config
 
 import (
@@ -17,42 +17,64 @@ import (
 
 // Config is the fully-validated runtime configuration.
 type Config struct {
-	Port         int
-	Namespace    string
-	BypassToken  string
-	CookieDomain string
-	AppURL       string
+	Port      int
+	Namespace string
 
 	// Routes maps an incoming hostname to the in-cluster Service that serves it.
 	Routes map[string]routing.Upstream
+
+	// Auth is OFF when AuthToken is empty: Gatekeeper then acts as a plain
+	// scale-to-zero reverse proxy. When set, every request must present the token
+	// via AuthHeader or AuthCookie.
+	AuthToken  string
+	AuthHeader string
+	AuthCookie string
+	// LoginURL, if set, is where unauthenticated browser requests are redirected
+	// (with the original URL appended as ?redirect=). When empty, unauthenticated
+	// requests get a 401 instead.
+	LoginURL string
+	// AuthCallbackPath serves a tiny page that reads ?token=&next=, sets the cookie,
+	// and redirects to next - the hand-back point for redirect-based logins.
+	AuthCallbackPath string
+	// CookieDomain, if set, scopes the cookie to ".<domain>" so it is shared across
+	// subdomains; empty means a host-only cookie.
+	CookieDomain string
 
 	IdleTimeout       time.Duration
 	IdleCheckInterval time.Duration
 	WakeTimeout       time.Duration
 
-	// SelfAppLabel is the value of the `app` label on Gatekeeper's own
-	// Deployment. The scaler uses it to exclude itself from scale-down, since
-	// Gatekeeper also carries the managed-by label.
-	SelfAppLabel string
-	// ManagedLabelSelector selects every previewkit-managed workload.
-	ManagedLabelSelector string
-	HealthPath           string
-	LogLevel             string
+	// TargetSelector is the label selector for workloads Gatekeeper scales. Empty
+	// selects every Deployment/StatefulSet in the namespace. SelfName is always
+	// excluded so Gatekeeper never scales itself.
+	TargetSelector         string
+	SelfName               string
+	WakeReplicasAnnotation string
+
+	HealthPath string
+	LogLevel   string
 }
+
+// AuthEnabled reports whether request authentication is active.
+func (c *Config) AuthEnabled() bool { return c.AuthToken != "" }
 
 // Load reads configuration from the environment and validates it. It returns an
 // error (rather than panicking) so the entrypoint can log and exit cleanly.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Port:                 intEnv("PORT", 8080),
-		Namespace:            os.Getenv("NAMESPACE"),
-		BypassToken:          os.Getenv("BYPASS_TOKEN"),
-		CookieDomain:         os.Getenv("COOKIE_DOMAIN"),
-		AppURL:               strings.TrimRight(os.Getenv("APP_URL"), "/"),
-		SelfAppLabel:         stringEnv("SELF_APP_LABEL", "gatekeeper"),
-		ManagedLabelSelector: stringEnv("MANAGED_LABEL_SELECTOR", "previewkit.dev/managed-by=previewkit"),
-		HealthPath:           stringEnv("HEALTH_PATH", "/gatekeeper-health"),
-		LogLevel:             stringEnv("LOG_LEVEL", "info"),
+		Port:                   intEnv("PORT", 8080),
+		Namespace:              os.Getenv("NAMESPACE"),
+		AuthToken:              os.Getenv("AUTH_TOKEN"),
+		AuthHeader:             stringEnv("AUTH_HEADER", "X-Gatekeeper-Token"),
+		AuthCookie:             stringEnv("AUTH_COOKIE", "gatekeeper_session"),
+		LoginURL:               strings.TrimRight(os.Getenv("LOGIN_URL"), "/"),
+		AuthCallbackPath:       stringEnv("AUTH_CALLBACK_PATH", "/_gatekeeper/auth"),
+		CookieDomain:           os.Getenv("COOKIE_DOMAIN"),
+		TargetSelector:         stringEnv("TARGET_SELECTOR", "gatekeeper.dev/scale-to-zero=true"),
+		SelfName:               stringEnv("SELF_NAME", "gatekeeper"),
+		WakeReplicasAnnotation: stringEnv("WAKE_REPLICAS_ANNOTATION", "gatekeeper.dev/wake-replicas"),
+		HealthPath:             stringEnv("HEALTH_PATH", "/healthz"),
+		LogLevel:               stringEnv("LOG_LEVEL", "info"),
 	}
 
 	var err error
@@ -77,21 +99,8 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	missing := make([]string, 0, 4)
 	if c.Namespace == "" {
-		missing = append(missing, "NAMESPACE")
-	}
-	if c.BypassToken == "" {
-		missing = append(missing, "BYPASS_TOKEN")
-	}
-	if c.CookieDomain == "" {
-		missing = append(missing, "COOKIE_DOMAIN")
-	}
-	if c.AppURL == "" {
-		missing = append(missing, "APP_URL")
-	}
-	if len(missing) > 0 {
-		return fmt.Errorf("missing required environment variables: %s", strings.Join(missing, ", "))
+		return errors.New("NAMESPACE is required")
 	}
 	if len(c.Routes) == 0 {
 		return errors.New("ROUTES_JSON must define at least one host -> upstream mapping")

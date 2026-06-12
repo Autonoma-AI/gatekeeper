@@ -1,13 +1,13 @@
-# The Gatekeeper pod. It carries previewkit.dev/managed-by=previewkit like every
-# managed workload, but excludes itself from scaling via the app=gatekeeper label.
+# The Gatekeeper pod. It manages the namespace it runs in (NAMESPACE comes from
+# the downward API) and excludes itself from scaling via SELF_NAME (= its own
+# Deployment name, "gatekeeper").
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: gatekeeper
-  namespace: preview-example
+  namespace: gatekeeper
   labels:
     app: gatekeeper
-    previewkit.dev/managed-by: previewkit
 spec:
   replicas: 1
   selector:
@@ -17,39 +17,41 @@ spec:
     metadata:
       labels:
         app: gatekeeper
-        previewkit.dev/managed-by: previewkit
     spec:
       serviceAccountName: gatekeeper
       containers:
         - name: gatekeeper
           image: ghcr.io/autonoma-ai/gatekeeper:latest
-          imagePullPolicy: Always
+          imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
           env:
+            # --- required ---
             - name: NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-            - name: BYPASS_TOKEN
-              value: "REPLACE_WITH_ENVIRONMENT_BYPASS_TOKEN"
-            - name: COOKIE_DOMAIN
-              value: "preview.autonoma.app"
-            - name: APP_URL
-              value: "https://beta.autonoma.app"
-            - name: IDLE_TIMEOUT
-              value: "30m"
             - name: ROUTES_JSON
               valueFrom:
                 configMapKeyRef:
                   name: gatekeeper-routes
                   key: routes.json
+            # --- scale-to-zero (optional; defaults shown) ---
+            - name: IDLE_TIMEOUT
+              value: "30m"
+            # --- auth (optional; leaving AUTH_TOKEN unset disables auth) ---
+            # - name: AUTH_TOKEN
+            #   value: "change-me"
+            # - name: LOGIN_URL
+            #   value: "https://login.example.com"
+            # - name: COOKIE_DOMAIN
+            #   value: "example.com"
           readinessProbe:
             httpGet:
-              path: /gatekeeper-health
+              path: /healthz
               port: 8080
-            initialDelaySeconds: 2
-            periodSeconds: 5
+            initialDelaySeconds: 1
+            periodSeconds: 3
           resources:
             requests:
               cpu: 25m

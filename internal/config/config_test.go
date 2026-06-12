@@ -7,80 +7,97 @@ import (
 
 func TestParseRoutes(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
-		routes, err := parseRoutes(`{"WEB.preview.test":{"service":"web","port":3000},"api.preview.test":{"service":"api","port":8080}}`)
+		routes, err := parseRoutes(`{"WEB.example.test":{"service":"web","port":3000}}`)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		// Hosts are lowercased.
-		if up, ok := routes["web.preview.test"]; !ok || up.Service != "web" || up.Port != 3000 {
+		if up, ok := routes["web.example.test"]; !ok || up.Service != "web" || up.Port != 3000 {
 			t.Fatalf("web route = %+v ok=%v", up, ok)
 		}
 	})
-
-	tests := []struct {
-		name string
-		raw  string
-	}{
+	for _, tt := range []struct{ name, raw string }{
 		{"empty", ""},
-		{"invalid json", `{not json}`},
+		{"invalid json", `{nope}`},
 		{"empty service", `{"h":{"service":"","port":80}}`},
-		{"zero port", `{"h":{"service":"web","port":0}}`},
-		{"port too high", `{"h":{"service":"web","port":70000}}`},
-	}
-	for _, tt := range tests {
+		{"bad port", `{"h":{"service":"web","port":0}}`},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
 			if _, err := parseRoutes(tt.raw); err == nil {
-				t.Fatalf("parseRoutes(%q) expected error, got nil", tt.raw)
+				t.Fatalf("parseRoutes(%q) expected an error", tt.raw)
 			}
 		})
 	}
 }
 
-func TestLoad(t *testing.T) {
-	t.Run("success with defaults", func(t *testing.T) {
-		t.Setenv("NAMESPACE", "preview-acme-pr-7")
-		t.Setenv("BYPASS_TOKEN", "tok")
-		t.Setenv("COOKIE_DOMAIN", "preview.example.com")
-		t.Setenv("APP_URL", "https://app.example.com/")
-		t.Setenv("ROUTES_JSON", `{"web.preview.test":{"service":"web","port":3000}}`)
+func setMinimalEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("NAMESPACE", "ns")
+	t.Setenv("ROUTES_JSON", `{"web.example.test":{"service":"web","port":3000}}`)
+}
 
-		cfg, err := Load()
-		if err != nil {
-			t.Fatalf("Load: %v", err)
-		}
-		if cfg.IdleTimeout != 30*time.Minute {
-			t.Errorf("IdleTimeout default = %v, want 30m", cfg.IdleTimeout)
-		}
-		if cfg.AppURL != "https://app.example.com" {
-			t.Errorf("AppURL = %q, want trailing slash trimmed", cfg.AppURL)
-		}
-		if cfg.Port != 8080 || cfg.SelfAppLabel != "gatekeeper" {
-			t.Errorf("unexpected defaults: port=%d selfApp=%q", cfg.Port, cfg.SelfAppLabel)
-		}
-	})
+func TestLoadDefaults(t *testing.T) {
+	setMinimalEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.AuthEnabled() {
+		t.Error("auth should be disabled when AUTH_TOKEN is empty")
+	}
+	if cfg.AuthHeader != "X-Gatekeeper-Token" || cfg.AuthCookie != "gatekeeper_session" {
+		t.Errorf("auth header/cookie defaults = %q / %q", cfg.AuthHeader, cfg.AuthCookie)
+	}
+	if cfg.TargetSelector != "gatekeeper.dev/scale-to-zero=true" {
+		t.Errorf("TargetSelector default = %q", cfg.TargetSelector)
+	}
+	if cfg.SelfName != "gatekeeper" || cfg.WakeReplicasAnnotation != "gatekeeper.dev/wake-replicas" {
+		t.Errorf("self/annotation defaults = %q / %q", cfg.SelfName, cfg.WakeReplicasAnnotation)
+	}
+	if cfg.HealthPath != "/healthz" || cfg.AuthCallbackPath != "/_gatekeeper/auth" {
+		t.Errorf("path defaults = %q / %q", cfg.HealthPath, cfg.AuthCallbackPath)
+	}
+	if cfg.IdleTimeout != 30*time.Minute || cfg.Port != 8080 {
+		t.Errorf("idle/port defaults = %v / %d", cfg.IdleTimeout, cfg.Port)
+	}
+}
 
-	t.Run("missing required vars", func(t *testing.T) {
+func TestLoadAuthEnabled(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("AUTH_TOKEN", "secret")
+	t.Setenv("LOGIN_URL", "https://login.example.com/")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.AuthEnabled() {
+		t.Error("auth should be enabled when AUTH_TOKEN is set")
+	}
+	if cfg.LoginURL != "https://login.example.com" {
+		t.Errorf("LoginURL trailing slash not trimmed: %q", cfg.LoginURL)
+	}
+}
+
+func TestLoadRequiresNamespaceAndRoutes(t *testing.T) {
+	t.Run("missing namespace", func(t *testing.T) {
 		t.Setenv("NAMESPACE", "")
-		t.Setenv("BYPASS_TOKEN", "")
-		t.Setenv("COOKIE_DOMAIN", "")
-		t.Setenv("APP_URL", "")
-		t.Setenv("ROUTES_JSON", `{"web.preview.test":{"service":"web","port":3000}}`)
-
+		t.Setenv("ROUTES_JSON", `{"web.example.test":{"service":"web","port":3000}}`)
 		if _, err := Load(); err == nil {
-			t.Fatal("Load expected error for missing required vars, got nil")
+			t.Fatal("expected error for missing NAMESPACE")
 		}
 	})
-
-	t.Run("invalid duration", func(t *testing.T) {
+	t.Run("missing routes", func(t *testing.T) {
 		t.Setenv("NAMESPACE", "ns")
-		t.Setenv("BYPASS_TOKEN", "tok")
-		t.Setenv("COOKIE_DOMAIN", "d")
-		t.Setenv("APP_URL", "https://app.example.com")
-		t.Setenv("ROUTES_JSON", `{"web.preview.test":{"service":"web","port":3000}}`)
-		t.Setenv("IDLE_TIMEOUT", "not-a-duration")
-
+		t.Setenv("ROUTES_JSON", "")
 		if _, err := Load(); err == nil {
-			t.Fatal("Load expected error for invalid IDLE_TIMEOUT, got nil")
+			t.Fatal("expected error for missing ROUTES_JSON")
 		}
 	})
+}
+
+func TestLoadInvalidDuration(t *testing.T) {
+	setMinimalEnv(t)
+	t.Setenv("IDLE_TIMEOUT", "not-a-duration")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected error for invalid IDLE_TIMEOUT")
+	}
 }
