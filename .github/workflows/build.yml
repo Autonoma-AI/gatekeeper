@@ -6,7 +6,7 @@ on:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REGISTRY: 140023360995.dkr.ecr.us-east-1.amazonaws.com
+  ECR_REGISTRY: public.ecr.aws/autonoma
 
 jobs:
   build:
@@ -19,6 +19,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -26,17 +32,24 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SERVICE_ACCOUNT_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to ECR
+      - name: Login to Amazon ECR Public
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
 
       - name: Set outputs
         id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      - uses: docker/build-push-action@v6
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ${{ env.ECR_REGISTRY }}/gatekeeper/gatekeeper:${{ steps.vars.outputs.sha_short }}
-            ${{ env.ECR_REGISTRY }}/gatekeeper/gatekeeper:latest
+            ${{ env.ECR_REGISTRY }}/gatekeeper:${{ steps.vars.outputs.sha_short }}
+            ${{ env.ECR_REGISTRY }}/gatekeeper:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
