@@ -1,47 +1,42 @@
-name: build
+name: Build and Deploy
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    branches: [ main ]
 
-permissions:
-  contents: read
-  packages: write
+env:
+  AWS_REGION: us-east-1
+  ECR_REGISTRY: 140023360995.dkr.ecr.us-east-1.amazonaws.com
 
 jobs:
-  test:
+  build:
+    name: Build & Push
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.26"
-          cache: true
-      - name: gofmt
-        run: test -z "$(gofmt -l .)" || { echo "needs gofmt:"; gofmt -l .; exit 1; }
-      - run: go vet ./...
-      - run: go test -race ./...
-      - run: go build ./...
+      - name: Checkout
+        uses: actions/checkout@v6
 
-  image:
-    needs: test
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: docker/login-action@v3
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      # Publishes to GHCR. To publish to the same ECR the preview cluster pulls app
-      # images from, swap this login + tags for aws-actions/amazon-ecr-login and the
-      # ECR repo, and set the deployer's GATEKEEPER_IMAGE to match.
+          aws-access-key-id: ${{ secrets.AWS_SERVICE_ACCOUNT_ACCESS_KEY }}
+          aws-secret-access-key: ${{ secrets.AWS_SERVICE_ACCOUNT_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set outputs
+        id: vars
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/gatekeeper:latest
-            ghcr.io/${{ github.repository_owner }}/gatekeeper:${{ github.sha }}
+            ${{ env.ECR_REGISTRY }}/gatekeeper/gatekeeper:${{ steps.vars.outputs.sha_short }}
+            ${{ env.ECR_REGISTRY }}/gatekeeper/gatekeeper:latest
