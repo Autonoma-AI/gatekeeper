@@ -1,7 +1,9 @@
 # Binaries
 /bin/
 /out/
-gatekeeper
+# Anchored to the repo root so it only ignores a root-level `gatekeeper` binary
+# (e.g. from `go build` at the root) - NOT the cmd/gatekeeper/ source package.
+/gatekeeper
 
 # Test / coverage
 *.out
