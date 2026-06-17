@@ -27,7 +27,8 @@ type Waker interface {
 	EnsureAwake(ctx context.Context) error
 }
 
-// ReadinessWaiter blocks until a Service has a ready endpoint (or ctx expires).
+// ReadinessWaiter blocks until a Service has a ready endpoint, returns early if a
+// backing pod is wedged and won't become ready, or ctx expires.
 type ReadinessWaiter interface {
 	WaitForReady(ctx context.Context, service string) error
 }

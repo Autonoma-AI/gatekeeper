@@ -59,6 +59,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.IdleTimeout != 30*time.Minute || cfg.Port != 8080 {
 		t.Errorf("idle/port defaults = %v / %d", cfg.IdleTimeout, cfg.Port)
 	}
+	if cfg.WakeTimeout != 5*time.Minute {
+		t.Errorf("WakeTimeout default = %v, want 5m", cfg.WakeTimeout)
+	}
 }
 
 func TestLoadAuthEnabled(t *testing.T) {

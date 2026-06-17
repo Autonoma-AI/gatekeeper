@@ -1,10 +1,13 @@
-# REQUIRED only when the namespace runs a default-deny egress NetworkPolicy that
-# excludes RFC1918 ranges (a common namespace-isolation setup). Without it,
-# Gatekeeper cannot reach the in-cluster Kubernetes API server and every scale
-# call hangs.
+# REQUIRED when the namespace runs a default-deny egress NetworkPolicy. Without it,
+# Gatekeeper can't reach the in-cluster Kubernetes API server and every scale call
+# hangs (dial tcp <apiserver>:443: i/o timeout).
 #
-# Scoped to the Gatekeeper pod only (app=gatekeeper), so other pods keep their
-# egress rules unchanged. NetworkPolicies are additive whitelists.
+# Scoped to the Gatekeeper pod only (app=gatekeeper). IMPORTANT: if another egress
+# policy that ALSO selects this pod uses `ipBlock` with an `except` (e.g. 0.0.0.0/0
+# except RFC1918), the AWS VPC CNI agent enforces that `except` as a longest-prefix
+# DENY that shadows the 0.0.0.0/0 allow below - so this policy alone won't help. Keep
+# such broad `except` policies off the Gatekeeper pod (podSelector NotIn app=gatekeeper)
+# or make the allow more specific than the except. See the README's RBAC section.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

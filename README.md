@@ -20,7 +20,10 @@ front of them and:
   period, remembering each one's replica count.
 - **Wakes on demand**: the next request restores those replicas, waits for the
   target Service's endpoints to become ready, then proxies through (Knative
-  activator style). Websocket upgrades and streaming responses are supported.
+  activator style). It keeps holding the request for as long as the pods are
+  legitimately starting, and only gives up early if a backing pod is wedged in a
+  state it won't recover from (bad/missing image, crash loop) - rather than
+  failing on a fixed timer. Websocket upgrades and streaming responses are supported.
 - **Optionally authenticates** requests with a shared token via a header or
   cookie, with an optional redirect to an external login.
 
@@ -89,7 +92,19 @@ All configuration is via environment variables.
 | `WAKE_REPLICAS_ANNOTATION` | `gatekeeper.dev/wake-replicas` | Annotation storing the pre-sleep replica count. |
 | `IDLE_TIMEOUT` | `30m` | Idle duration before scaling to zero (Go duration). |
 | `IDLE_CHECK_INTERVAL` | `30s` | How often idleness is checked. |
-| `WAKE_TIMEOUT` | `90s` | Max time to hold a request while waking; then 503 + `Retry-After`. |
+| `WAKE_TIMEOUT` | `5m` | Backstop for how long a request is held while waking before giving up (503 + `Retry-After`). Generous so slow-but-healthy starts (large image pulls, cold nodes) aren't cut off; a wake that hits a wedged pod fails fast well before this. |
+
+### Two settings that must line up
+
+Most "it deployed but nothing works" cases come from one of these drifting out of sync:
+
+- **`HEALTH_PATH` must equal your readiness/liveness probe path.** The probe hits this
+  path on the pod IP; if Gatekeeper doesn't recognize it as the health path the request
+  falls through to host-routing, 404s (`no route for host: <pod-ip>:8080` in the logs),
+  and the pod never goes Ready - so the Service has no endpoints.
+- **`TARGET_SELECTOR` must match the labels on the workloads you want scaled** (and
+  `SELF_NAME` must be Gatekeeper's own Deployment name so it never scales itself). If the
+  selector matches nothing, idle scaling silently does nothing.
 
 ### Authentication (optional)
 
@@ -129,15 +144,34 @@ rules:
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["get", "list"]
+  - apiGroups: [""]
+    resources: ["services", "pods"]
+    verbs: ["get", "list"]
 ```
 
 `patch` on the workloads sets `spec.replicas` and the wake annotation in one merge
-patch; `endpointslices` are polled for readiness. `deploy/` contains the full set
+patch; `endpointslices` are polled for readiness. `services` (read once per wake for
+the pod selector) and `pods` let a wake fail fast when a backing pod is wedged
+instead of waiting out `WAKE_TIMEOUT`. `deploy/` contains the full set
 (ServiceAccount, Role, RoleBinding).
 
-> If the namespace runs a default-deny egress NetworkPolicy, Gatekeeper also needs
-> egress to the Kubernetes API server (see `deploy/networkpolicy-apiserver-egress.yaml`),
-> or every scale call will hang.
+> **API-server egress (CNIs that enforce NetworkPolicy: AWS VPC CNI `aws-node`, Calico,
+> Cilium, ...).** Under a default-deny egress policy, Gatekeeper's scale calls to the
+> Kubernetes API server are dropped - you'll see `dial tcp <apiserver-ip>:443: i/o timeout` -
+> until you allow it. Apply `deploy/networkpolicy-apiserver-egress.yaml`, which permits
+> egress to `0.0.0.0/0:443,6443` for the Gatekeeper pod only. Two subtleties bite here:
+>
+> - A broad egress policy that `ipBlock`s `0.0.0.0/0` with an `except` for RFC1918 ranges
+>   still blocks the API server, since its ClusterIP/ENI lives in those ranges.
+> - Worse: if that `except`-bearing policy **also selects the Gatekeeper pod**, the AWS VPC
+>   CNI agent enforces each `except` as a longest-prefix-match **deny** that shadows this
+>   policy's `0.0.0.0/0` allow (the `/12` deny beats the `/0` allow). Adding the allow is then
+>   not enough - keep the `except`-bearing policy off the Gatekeeper pod (e.g.
+>   `podSelector: { matchExpressions: [{ key: app, operator: NotIn, values: [gatekeeper] }] }`)
+>   or make the API-server allow more specific than the `except` (e.g. the service CIDR `/16`).
+>
+> On **Cilium**, a plain `ipBlock` may not match the API-server identity - use a
+> `CiliumNetworkPolicy` with `toEntities: [kube-apiserver]` instead.
 
 ## Develop
 

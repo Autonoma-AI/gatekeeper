@@ -84,7 +84,7 @@ func Load() (*Config, error) {
 	if cfg.IdleCheckInterval, err = durationEnv("IDLE_CHECK_INTERVAL", 30*time.Second); err != nil {
 		return nil, err
 	}
-	if cfg.WakeTimeout, err = durationEnv("WAKE_TIMEOUT", 90*time.Second); err != nil {
+	if cfg.WakeTimeout, err = durationEnv("WAKE_TIMEOUT", 5*time.Minute); err != nil {
 		return nil, err
 	}
 

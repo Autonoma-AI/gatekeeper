@@ -1,4 +1,4 @@
-IMAGE ?= ghcr.io/autonoma-ai/gatekeeper:latest
+IMAGE ?= public.ecr.aws/autonoma/gatekeeper:latest
 
 .PHONY: build test vet fmt fmt-check tidy docker run all
 

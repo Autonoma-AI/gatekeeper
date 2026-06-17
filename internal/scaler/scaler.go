@@ -13,14 +13,23 @@ import (
 	"strconv"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
 const readinessPollInterval = 500 * time.Millisecond
+
+// ErrPodNotRunning reports that a Service's backing pod is wedged in a state it
+// will not recover from on its own (bad/missing image, crash loop, bad config),
+// so the wake wait gave up early instead of holding the request until the wake
+// timeout. Transient startup states and unschedulable pods are not treated as
+// failures - they may still resolve, so the wake timeout bounds those.
+var ErrPodNotRunning = errors.New("backing pod not running")
 
 // Scaler performs sleep/wake/readiness operations against one namespace.
 type Scaler struct {
@@ -148,8 +157,16 @@ func (s *Scaler) WakeAll(ctx context.Context) error {
 }
 
 // WaitForReady blocks until the named Service has at least one ready endpoint
-// address or ctx is cancelled (the caller sets the wake deadline on ctx).
+// address, a backing pod becomes wedged in a non-recoverable state (returning
+// ErrPodNotRunning so the caller can stop waiting early), or ctx is cancelled
+// (the caller sets the wake deadline on ctx).
 func (s *Scaler) WaitForReady(ctx context.Context, service string) error {
+	// Resolve the Service's pod selector once so we can spot pods that will never
+	// become ready (bad image, crash loop) and fail fast, rather than holding the
+	// request for the whole wake timeout. If the selector can't be read we skip
+	// the health check and let the timeout alone bound the wait.
+	selector := s.podSelector(ctx, service)
+
 	ticker := time.NewTicker(readinessPollInterval)
 	defer ticker.Stop()
 	for {
@@ -158,6 +175,11 @@ func (s *Scaler) WaitForReady(ctx context.Context, service string) error {
 			s.log.Warn("error checking service readiness", "service", service, "err", err)
 		} else if ready {
 			return nil
+		}
+		if selector != "" {
+			if name, reason, failed := s.podFailure(ctx, selector); failed {
+				return fmt.Errorf("%w: %s (%s)", ErrPodNotRunning, name, reason)
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -194,6 +216,79 @@ func (s *Scaler) serviceReady(ctx context.Context, service string) (bool, error)
 		}
 	}
 	return false, nil
+}
+
+// fatalWaitingReasons are container "waiting" reasons that mean a pod will not
+// reach Running without a change. CrashLoopBackOff and ImagePullBackOff are
+// already-retried backoff states; the rest are immediate, deterministic faults.
+// Transient states (Pending, ContainerCreating, PodInitializing) and an
+// unschedulable pod are deliberately excluded - they may still progress, so the
+// wake timeout (not this check) bounds them.
+var fatalWaitingReasons = map[string]bool{
+	"CrashLoopBackOff":           true,
+	"ImagePullBackOff":           true,
+	"ErrImagePull":               true,
+	"InvalidImageName":           true,
+	"CreateContainerConfigError": true,
+}
+
+// podSelector returns the label-selector string for a Service's pods, or "" if
+// the Service is missing, selector-less, or unreadable (callers then skip the
+// pod health check and rely on the wake timeout alone).
+func (s *Scaler) podSelector(ctx context.Context, service string) string {
+	svc, err := s.client.CoreV1().Services(s.namespace).Get(ctx, service, metav1.GetOptions{})
+	if err != nil {
+		s.log.Warn("could not read service for pod health checks; relying on wake timeout", "service", service, "err", err)
+		return ""
+	}
+	if len(svc.Spec.Selector) == 0 {
+		return ""
+	}
+	return labels.SelectorFromSet(svc.Spec.Selector).String()
+}
+
+// podFailure reports the first pod matching selector that is wedged in a
+// non-recoverable state, with a short reason for logging. A failure to list pods
+// is logged and treated as "no failure" so a transient API error never turns a
+// healthy wake into an error.
+func (s *Scaler) podFailure(ctx context.Context, selector string) (name, reason string, failed bool) {
+	pods, err := s.client.CoreV1().Pods(s.namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
+	if err != nil {
+		s.log.Warn("error listing pods for health check", "selector", selector, "err", err)
+		return "", "", false
+	}
+	for i := range pods.Items {
+		p := &pods.Items[i]
+		if r, bad := podFatalReason(p); bad {
+			return p.Name, r, true
+		}
+	}
+	return "", "", false
+}
+
+// podFatalReason reports whether a pod is wedged in a non-recoverable state and,
+// if so, a short reason. It checks the pod phase and both init and regular
+// container waiting states.
+func podFatalReason(p *corev1.Pod) (string, bool) {
+	if p.Status.Phase == corev1.PodFailed {
+		return "phase Failed", true
+	}
+	if r := fatalContainerReason(p.Status.InitContainerStatuses); r != "" {
+		return r, true
+	}
+	if r := fatalContainerReason(p.Status.ContainerStatuses); r != "" {
+		return r, true
+	}
+	return "", false
+}
+
+func fatalContainerReason(statuses []corev1.ContainerStatus) string {
+	for _, cs := range statuses {
+		if w := cs.State.Waiting; w != nil && fatalWaitingReasons[w.Reason] {
+			return w.Reason
+		}
+	}
+	return ""
 }
 
 func (s *Scaler) listManaged(ctx context.Context) ([]workload, error) {

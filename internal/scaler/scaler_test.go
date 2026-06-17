@@ -2,12 +2,14 @@ package scaler
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -149,6 +151,28 @@ func endpointSlice(service string, ready bool) *discoveryv1.EndpointSlice {
 	}
 }
 
+func service(name string, selector map[string]string) *corev1.Service {
+	return &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
+		Spec:       corev1.ServiceSpec{Selector: selector},
+	}
+}
+
+// pod builds a Pod in the given phase, optionally with a single app container
+// stuck in the named waiting reason (e.g. "ImagePullBackOff"); "" = no waiting.
+func pod(name string, labels map[string]string, phase corev1.PodPhase, waitingReason string) *corev1.Pod {
+	p := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS, Labels: labels},
+		Status:     corev1.PodStatus{Phase: phase},
+	}
+	if waitingReason != "" {
+		p.Status.ContainerStatuses = []corev1.ContainerStatus{
+			{Name: "app", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: waitingReason}}},
+		}
+	}
+	return p
+}
+
 func TestWaitForReady(t *testing.T) {
 	t.Run("ready when an endpoint slice has a ready address", func(t *testing.T) {
 		client := fake.NewSimpleClientset(endpointSlice("web", true))
@@ -173,4 +197,78 @@ func TestWaitForReady(t *testing.T) {
 			t.Fatal("expected a timeout error: endpoint is not ready")
 		}
 	})
+	t.Run("fails fast when a backing pod is wedged", func(t *testing.T) {
+		sel := map[string]string{"app": "web"}
+		client := fake.NewSimpleClientset(
+			service("web", sel),
+			pod("web-xyz", sel, corev1.PodPending, "ImagePullBackOff"),
+		)
+		// A generous deadline: the test passes by failing fast, not by timing out.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err := newScaler(client).WaitForReady(ctx, "web")
+		if !errors.Is(err, ErrPodNotRunning) {
+			t.Fatalf("WaitForReady err=%v, want ErrPodNotRunning", err)
+		}
+	})
+	t.Run("a ready endpoint wins over a wedged pod", func(t *testing.T) {
+		sel := map[string]string{"app": "web"}
+		client := fake.NewSimpleClientset(
+			service("web", sel),
+			pod("web-xyz", sel, corev1.PodRunning, "CrashLoopBackOff"),
+			endpointSlice("web", true),
+		)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := newScaler(client).WaitForReady(ctx, "web"); err != nil {
+			t.Fatalf("WaitForReady: %v, want nil (a ready endpoint should win)", err)
+		}
+	})
+	t.Run("a still-starting pod is tolerated until the timeout", func(t *testing.T) {
+		sel := map[string]string{"app": "web"}
+		client := fake.NewSimpleClientset(
+			service("web", sel),
+			pod("web-xyz", sel, corev1.PodPending, "ContainerCreating"),
+		)
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		defer cancel()
+		err := newScaler(client).WaitForReady(ctx, "web")
+		if err == nil || errors.Is(err, ErrPodNotRunning) {
+			t.Fatalf("WaitForReady err=%v, want a timeout (ContainerCreating is not fatal)", err)
+		}
+	})
+}
+
+func TestPodFatalReason(t *testing.T) {
+	initPod := func(reason string) *corev1.Pod {
+		p := pod("p", nil, corev1.PodPending, "")
+		p.Status.InitContainerStatuses = []corev1.ContainerStatus{
+			{Name: "init", State: corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{Reason: reason}}},
+		}
+		return p
+	}
+	cases := []struct {
+		name    string
+		pod     *corev1.Pod
+		wantBad bool
+	}{
+		{"running", pod("p", nil, corev1.PodRunning, ""), false},
+		{"pending creating", pod("p", nil, corev1.PodPending, "ContainerCreating"), false},
+		{"pending initializing", pod("p", nil, corev1.PodPending, "PodInitializing"), false},
+		{"image pull backoff", pod("p", nil, corev1.PodPending, "ImagePullBackOff"), true},
+		{"err image pull", pod("p", nil, corev1.PodPending, "ErrImagePull"), true},
+		{"invalid image name", pod("p", nil, corev1.PodPending, "InvalidImageName"), true},
+		{"config error", pod("p", nil, corev1.PodPending, "CreateContainerConfigError"), true},
+		{"crash loop", pod("p", nil, corev1.PodRunning, "CrashLoopBackOff"), true},
+		{"phase failed", pod("p", nil, corev1.PodFailed, ""), true},
+		{"init crash loop", initPod("CrashLoopBackOff"), true},
+		{"init creating", initPod("ContainerCreating"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, bad := podFatalReason(tc.pod); bad != tc.wantBad {
+				t.Errorf("podFatalReason bad=%v, want %v", bad, tc.wantBad)
+			}
+		})
+	}
 }

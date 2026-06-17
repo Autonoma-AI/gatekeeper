@@ -21,7 +21,7 @@ spec:
       serviceAccountName: gatekeeper
       containers:
         - name: gatekeeper
-          image: ghcr.io/autonoma-ai/gatekeeper:latest
+          image: public.ecr.aws/autonoma/gatekeeper:latest
           imagePullPolicy: IfNotPresent
           ports:
             - containerPort: 8080
@@ -36,9 +36,21 @@ spec:
                 configMapKeyRef:
                   name: gatekeeper-routes
                   key: routes.json
-            # --- scale-to-zero (optional; defaults shown) ---
+            # --- scale-to-zero ---
+            # TARGET_SELECTOR MUST match the labels on the workloads you want scaled
+            # (here: anything labeled gatekeeper.dev/scale-to-zero=true). SELF_NAME is
+            # this Deployment's name, excluded so Gatekeeper never scales itself.
+            - name: TARGET_SELECTOR
+              value: "gatekeeper.dev/scale-to-zero=true"
+            - name: SELF_NAME
+              value: "gatekeeper"
             - name: IDLE_TIMEOUT
               value: "30m"
+            # HEALTH_PATH MUST equal the readinessProbe path below (and any livenessProbe).
+            # If they disagree the probe hits a normal route, 404s, and the pod never
+            # goes Ready - so ingress gets no endpoint.
+            - name: HEALTH_PATH
+              value: "/healthz"
             # --- auth (optional; leaving AUTH_TOKEN unset disables auth) ---
             # - name: AUTH_TOKEN
             #   value: "change-me"
@@ -48,7 +60,7 @@ spec:
             #   value: "example.com"
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /healthz # MUST equal HEALTH_PATH above
               port: 8080
             initialDelaySeconds: 1
             periodSeconds: 3
