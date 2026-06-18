@@ -17,13 +17,16 @@ rarely-used services) burn CPU and memory around the clock. Gatekeeper sits in
 front of them and:
 
 - **Scales to zero** every selected Deployment and StatefulSet after an idle
-  period, remembering each one's replica count.
-- **Wakes on demand**: the next request restores those replicas, waits for the
-  target Service's endpoints to become ready, then proxies through (Knative
-  activator style). It keeps holding the request for as long as the pods are
-  legitimately starting, and only gives up early if a backing pod is wedged in a
-  state it won't recover from (bad/missing image, crash loop) - rather than
-  failing on a fixed timer. Websocket upgrades and streaming responses are supported.
+  period, remembering each one's replica count (set `IDLE_TIMEOUT=0` to disable
+  and run as a pure wake-on-request proxy).
+- **Wakes on demand**: the next request restores those replicas and waits for
+  **every managed workload in the namespace** to become ready before proxying
+  through (Knative activator style) - not just the Service it routes to, so an app
+  is never sent traffic before the database (or other dependency) it needs is up.
+  It keeps holding the request for as long as the pods are legitimately starting,
+  and only gives up early if a pod is wedged in a state it won't recover from
+  (bad/missing image, crash loop) - rather than failing on a fixed timer. Websocket
+  upgrades and streaming responses are supported.
 - **Optionally authenticates** requests with a shared token via a header or
   cookie, with an optional redirect to an external login.
 
@@ -90,9 +93,9 @@ All configuration is via environment variables.
 | `TARGET_SELECTOR` | `gatekeeper.dev/scale-to-zero=true` | Label selector for managed Deployments/StatefulSets. Empty selects every workload in the namespace. |
 | `SELF_NAME` | `gatekeeper` | Workload name Gatekeeper never scales (itself). |
 | `WAKE_REPLICAS_ANNOTATION` | `gatekeeper.dev/wake-replicas` | Annotation storing the pre-sleep replica count. |
-| `IDLE_TIMEOUT` | `30m` | Idle duration before scaling to zero (Go duration). |
+| `IDLE_TIMEOUT` | `30m` | Idle duration before scaling to zero (Go duration). Set to `0` to disable scale-to-zero: the namespace is never auto-slept, but requests still wake one that is already asleep. |
 | `IDLE_CHECK_INTERVAL` | `30s` | How often idleness is checked. |
-| `WAKE_TIMEOUT` | `5m` | Backstop for how long a request is held while waking before giving up (503 + `Retry-After`). Generous so slow-but-healthy starts (large image pulls, cold nodes) aren't cut off; a wake that hits a wedged pod fails fast well before this. |
+| `WAKE_TIMEOUT` | `5m` | Backstop for how long a request is held while the namespace wakes (all managed workloads become ready) before giving up (503 + `Retry-After`). Generous so slow-but-healthy starts (large image pulls, cold nodes) aren't cut off; a wake that hits a wedged pod fails fast well before this. |
 
 ### Two settings that must line up
 
@@ -141,18 +144,15 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "patch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list"]
   - apiGroups: [""]
-    resources: ["services", "pods"]
-    verbs: ["get", "list"]
+    resources: ["pods"]
+    verbs: ["list"]
 ```
 
 `patch` on the workloads sets `spec.replicas` and the wake annotation in one merge
-patch; `endpointslices` are polled for readiness. `services` (read once per wake for
-the pod selector) and `pods` let a wake fail fast when a backing pod is wedged
-instead of waiting out `WAKE_TIMEOUT`. `deploy/` contains the full set
+patch; their `status.readyReplicas` is polled to know when the namespace is ready.
+`pods` are listed on wake to fail fast when a managed pod is wedged (bad image,
+crash loop) instead of waiting out `WAKE_TIMEOUT`. `deploy/` contains the full set
 (ServiceAccount, Role, RoleBinding).
 
 > **API-server egress (CNIs that enforce NetworkPolicy: AWS VPC CNI `aws-node`, Calico,

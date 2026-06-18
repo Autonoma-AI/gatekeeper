@@ -61,3 +61,20 @@ func TestLoopTick(t *testing.T) {
 		})
 	}
 }
+
+// A zero idle timeout disables scale-to-zero: Run returns at once and never sleeps,
+// even with the namespace awake and idle far past any threshold.
+func TestRunDisabledWhenIdleTimeoutZero(t *testing.T) {
+	sleeper := &fakeSleeper{asleep: false}
+	loop := New(&fakeReporter{idle: time.Hour}, sleeper, 0, time.Millisecond, testLogger())
+
+	// Bounded ctx so a regression (loop not actually disabled) fails fast instead
+	// of hanging: a disabled loop returns immediately, well within this deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	loop.Run(ctx)
+
+	if sleeper.sleepCalls != 0 {
+		t.Fatalf("sleepCalls = %d, want 0 (scale-to-zero disabled)", sleeper.sleepCalls)
+	}
+}

@@ -10,7 +10,6 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
@@ -25,8 +24,6 @@ const (
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
 func ptr(i int32) *int32 { return &i }
-
-func boolPtr(b bool) *bool { return &b }
 
 func deploy(name string, replicas int32, ann map[string]string) *appsv1.Deployment {
 	return &appsv1.Deployment{
@@ -138,24 +135,18 @@ func TestIsAsleep(t *testing.T) {
 	})
 }
 
-func endpointSlice(service string, ready bool) *discoveryv1.EndpointSlice {
-	return &discoveryv1.EndpointSlice{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      service + "-abc",
-			Namespace: testNS,
-			Labels:    map[string]string{discoveryv1.LabelServiceName: service},
-		},
-		Endpoints: []discoveryv1.Endpoint{
-			{Addresses: []string{"10.0.0.1"}, Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(ready)}},
-		},
-	}
+// deployReady / stsReady build a workload with an explicit desired/ready replica
+// split, so readiness can be exercised without a live controller populating status.
+func deployReady(name string, replicas, ready int32) *appsv1.Deployment {
+	d := deploy(name, replicas, nil)
+	d.Status.ReadyReplicas = ready
+	return d
 }
 
-func service(name string, selector map[string]string) *corev1.Service {
-	return &corev1.Service{
-		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNS},
-		Spec:       corev1.ServiceSpec{Selector: selector},
-	}
+func stsReady(name string, replicas, ready int32) *appsv1.StatefulSet {
+	s := statefulSet(name, replicas, nil)
+	s.Status.ReadyReplicas = ready
+	return s
 }
 
 // pod builds a Pod in the given phase, optionally with a single app container
@@ -174,65 +165,70 @@ func pod(name string, labels map[string]string, phase corev1.PodPhase, waitingRe
 }
 
 func TestWaitForReady(t *testing.T) {
-	t.Run("ready when an endpoint slice has a ready address", func(t *testing.T) {
-		client := fake.NewSimpleClientset(endpointSlice("web", true))
+	t.Run("returns when every managed workload is ready", func(t *testing.T) {
+		client := fake.NewSimpleClientset(
+			deployReady("web", 1, 1),
+			stsReady("db", 1, 1),
+		)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if err := newScaler(client).WaitForReady(ctx, "web"); err != nil {
+		if err := newScaler(client).WaitForReady(ctx); err != nil {
 			t.Fatalf("WaitForReady: %v", err)
 		}
 	})
-	t.Run("times out when no endpoint slices exist", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
-		defer cancel()
-		if err := newScaler(fake.NewSimpleClientset()).WaitForReady(ctx, "web"); err == nil {
-			t.Fatal("expected a timeout error")
-		}
-	})
-	t.Run("times out when the only endpoint is not ready", func(t *testing.T) {
-		client := fake.NewSimpleClientset(endpointSlice("web", false))
-		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
-		defer cancel()
-		if err := newScaler(client).WaitForReady(ctx, "web"); err == nil {
-			t.Fatal("expected a timeout error: endpoint is not ready")
-		}
-	})
-	t.Run("fails fast when a backing pod is wedged", func(t *testing.T) {
-		sel := map[string]string{"app": "web"}
+	t.Run("waits for a dependency that is not ready yet", func(t *testing.T) {
+		// web is ready but db (its dependency) is not: the request must keep waiting
+		// instead of proxying to a web that would crash without the database.
 		client := fake.NewSimpleClientset(
-			service("web", sel),
-			pod("web-xyz", sel, corev1.PodPending, "ImagePullBackOff"),
+			deployReady("web", 1, 1),
+			stsReady("db", 1, 0),
 		)
-		// A generous deadline: the test passes by failing fast, not by timing out.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 		defer cancel()
-		err := newScaler(client).WaitForReady(ctx, "web")
-		if !errors.Is(err, ErrPodNotRunning) {
-			t.Fatalf("WaitForReady err=%v, want ErrPodNotRunning", err)
+		err := newScaler(client).WaitForReady(ctx)
+		if err == nil || errors.Is(err, ErrPodNotRunning) {
+			t.Fatalf("WaitForReady err=%v, want a timeout while db is not ready", err)
 		}
 	})
-	t.Run("a ready endpoint wins over a wedged pod", func(t *testing.T) {
-		sel := map[string]string{"app": "web"}
+	t.Run("ignores workloads scaled to zero", func(t *testing.T) {
 		client := fake.NewSimpleClientset(
-			service("web", sel),
-			pod("web-xyz", sel, corev1.PodRunning, "CrashLoopBackOff"),
-			endpointSlice("web", true),
+			deployReady("web", 1, 1),
+			deployReady("idle", 0, 0), // intentionally at zero - nothing to wait for
 		)
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		if err := newScaler(client).WaitForReady(ctx, "web"); err != nil {
-			t.Fatalf("WaitForReady: %v, want nil (a ready endpoint should win)", err)
+		if err := newScaler(client).WaitForReady(ctx); err != nil {
+			t.Fatalf("WaitForReady: %v", err)
 		}
 	})
-	t.Run("a still-starting pod is tolerated until the timeout", func(t *testing.T) {
-		sel := map[string]string{"app": "web"}
+	t.Run("times out when a workload never becomes ready", func(t *testing.T) {
+		client := fake.NewSimpleClientset(deployReady("web", 1, 0))
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		defer cancel()
+		if err := newScaler(client).WaitForReady(ctx); err == nil {
+			t.Fatal("expected a timeout error")
+		}
+	})
+	t.Run("fails fast when a managed pod is wedged", func(t *testing.T) {
 		client := fake.NewSimpleClientset(
-			service("web", sel),
-			pod("web-xyz", sel, corev1.PodPending, "ContainerCreating"),
+			deployReady("web", 1, 0),
+			pod("web-xyz", nil, corev1.PodPending, "ImagePullBackOff"),
+		)
+		// Generous deadline: the test passes by failing fast, not by timing out.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := newScaler(client).WaitForReady(ctx); !errors.Is(err, ErrPodNotRunning) {
+			t.Fatalf("WaitForReady err=%v, want ErrPodNotRunning", err)
+		}
+	})
+	t.Run("tolerates a still-starting pod until the timeout", func(t *testing.T) {
+		client := fake.NewSimpleClientset(
+			deployReady("web", 1, 0),
+			pod("web-xyz", nil, corev1.PodPending, "ContainerCreating"),
 		)
 		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
 		defer cancel()
-		err := newScaler(client).WaitForReady(ctx, "web")
+		err := newScaler(client).WaitForReady(ctx)
 		if err == nil || errors.Is(err, ErrPodNotRunning) {
 			t.Fatalf("WaitForReady err=%v, want a timeout (ContainerCreating is not fatal)", err)
 		}

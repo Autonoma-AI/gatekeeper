@@ -39,8 +39,15 @@ func New(tracker ActivityReporter, sleeper Sleeper, idleTimeout, interval time.D
 }
 
 // Run ticks until ctx is cancelled. On each tick, if the namespace is awake and
-// has been idle longer than idleTimeout, it scales the namespace to zero.
+// has been idle longer than idleTimeout, it scales the namespace to zero. A
+// non-positive idleTimeout disables scale-to-zero: Run logs and returns without
+// starting the ticker, so the namespace is never auto-slept (requests still wake
+// a namespace that is already asleep).
 func (l *Loop) Run(ctx context.Context) {
+	if l.idleTimeout <= 0 {
+		l.log.Info("scale-to-zero disabled (idle timeout <= 0); idle loop not started")
+		return
+	}
 	l.log.Info("idle loop started", "idleTimeout", l.idleTimeout.String(), "interval", l.interval.String())
 	ticker := time.NewTicker(l.interval)
 	defer ticker.Stop()

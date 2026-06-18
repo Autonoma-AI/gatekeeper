@@ -40,6 +40,8 @@ type Config struct {
 	// subdomains; empty means a host-only cookie.
 	CookieDomain string
 
+	// IdleTimeout is how long the namespace may be idle before being scaled to
+	// zero. Zero (or negative) disables scale-to-zero: see ScaleToZeroEnabled.
 	IdleTimeout       time.Duration
 	IdleCheckInterval time.Duration
 	WakeTimeout       time.Duration
@@ -57,6 +59,11 @@ type Config struct {
 
 // AuthEnabled reports whether request authentication is active.
 func (c *Config) AuthEnabled() bool { return c.AuthToken != "" }
+
+// ScaleToZeroEnabled reports whether idle scale-to-zero is active. A zero (or
+// negative) IDLE_TIMEOUT disables it: the namespace is never auto-slept, though
+// requests still wake a namespace that is already asleep.
+func (c *Config) ScaleToZeroEnabled() bool { return c.IdleTimeout > 0 }
 
 // Load reads configuration from the environment and validates it. It returns an
 // error (rather than panicking) so the entrypoint can log and exit cleanly.

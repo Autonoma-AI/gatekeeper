@@ -27,10 +27,10 @@ type Waker interface {
 	EnsureAwake(ctx context.Context) error
 }
 
-// ReadinessWaiter blocks until a Service has a ready endpoint, returns early if a
-// backing pod is wedged and won't become ready, or ctx expires.
+// ReadinessWaiter blocks until every managed workload in the namespace is ready,
+// returns early if a managed pod is wedged and won't become ready, or ctx expires.
 type ReadinessWaiter interface {
-	WaitForReady(ctx context.Context, service string) error
+	WaitForReady(ctx context.Context) error
 }
 
 // Toucher records request activity.
@@ -124,9 +124,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// 5. Record activity so the idle loop keeps the namespace awake.
 	h.tracker.Touch()
 
-	// 6. Wake the namespace and hold the request until the target is ready.
+	// 6. Wake the namespace and hold the request until every managed workload is
+	//    ready (not just this route's Service - so dependencies are up too).
 	if h.power.Asleep() {
-		if err := h.wakeAndWait(r.Context(), upstream.Service); err != nil {
+		if err := h.wakeAndWait(r.Context()); err != nil {
 			h.log.Error("wake failed", "host", r.Host, "service", upstream.Service, "err", err)
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, "Service is waking up, please retry shortly.", http.StatusServiceUnavailable)
@@ -144,13 +145,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxy.ServeHTTP(w, r.WithContext(withTarget(r.Context(), target)))
 }
 
-func (h *Handler) wakeAndWait(ctx context.Context, service string) error {
+func (h *Handler) wakeAndWait(ctx context.Context) error {
 	waitCtx, cancel := context.WithTimeout(ctx, h.wakeTimeout)
 	defer cancel()
 	if err := h.power.EnsureAwake(waitCtx); err != nil {
 		return fmt.Errorf("ensure awake: %w", err)
 	}
-	if err := h.readiness.WaitForReady(waitCtx, service); err != nil {
+	if err := h.readiness.WaitForReady(waitCtx); err != nil {
 		return fmt.Errorf("wait for ready: %w", err)
 	}
 	return nil

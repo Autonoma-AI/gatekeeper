@@ -1,6 +1,6 @@
 # Minimum to scale workloads and detect readiness within this namespace.
 # patch on the parent objects sets spec.replicas and the wake annotation in one
-# merge patch; endpointslices are polled to know when an upstream is ready.
+# merge patch; workload status (readyReplicas) and pod state are read on wake.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -10,11 +10,8 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get", "list", "watch", "patch"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["get", "list"]
-  # services: read a Service's pod selector; pods: fail a wake fast when a backing
-  # pod is wedged (bad image, crash loop) instead of waiting out the wake timeout.
+  # pods: on wake, fail fast when a managed pod is wedged (bad image, crash loop)
+  # instead of holding the request until the wake timeout.
   - apiGroups: [""]
-    resources: ["services", "pods"]
-    verbs: ["get", "list"]
+    resources: ["pods"]
+    verbs: ["list"]

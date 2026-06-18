@@ -53,6 +53,7 @@ func run() error {
 		"namespace", cfg.Namespace,
 		"port", cfg.Port,
 		"authEnabled", cfg.AuthEnabled(),
+		"scaleToZero", cfg.ScaleToZeroEnabled(),
 		"idleTimeout", cfg.IdleTimeout.String(),
 		"wakeTimeout", cfg.WakeTimeout.String(),
 		"targetSelector", cfg.TargetSelector,

@@ -97,6 +97,33 @@ func TestLoadRequiresNamespaceAndRoutes(t *testing.T) {
 	})
 }
 
+func TestScaleToZeroEnabled(t *testing.T) {
+	t.Run("default idle timeout enables scale-to-zero", func(t *testing.T) {
+		setMinimalEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.ScaleToZeroEnabled() {
+			t.Error("scale-to-zero should be enabled with the default IDLE_TIMEOUT")
+		}
+	})
+	t.Run("zero idle timeout disables scale-to-zero", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("IDLE_TIMEOUT", "0")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.IdleTimeout != 0 {
+			t.Errorf("IdleTimeout = %v, want 0", cfg.IdleTimeout)
+		}
+		if cfg.ScaleToZeroEnabled() {
+			t.Error("scale-to-zero should be disabled when IDLE_TIMEOUT is 0")
+		}
+	})
+}
+
 func TestLoadInvalidDuration(t *testing.T) {
 	setMinimalEnv(t)
 	t.Setenv("IDLE_TIMEOUT", "not-a-duration")

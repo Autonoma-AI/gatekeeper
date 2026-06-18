@@ -1,7 +1,7 @@
 // Package scaler reconciles the replica counts of the workloads it manages in a
 // single namespace: it scales every selected Deployment and StatefulSet to zero
 // on sleep, restores their saved counts on wake, and reports readiness by polling
-// Service Endpoints. It uses the pod's in-cluster ServiceAccount.
+// those workloads' status. It uses the pod's in-cluster ServiceAccount.
 package scaler
 
 import (
@@ -14,22 +14,20 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	discoveryv1 "k8s.io/api/discovery/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 )
 
 const readinessPollInterval = 500 * time.Millisecond
 
-// ErrPodNotRunning reports that a Service's backing pod is wedged in a state it
-// will not recover from on its own (bad/missing image, crash loop, bad config),
-// so the wake wait gave up early instead of holding the request until the wake
-// timeout. Transient startup states and unschedulable pods are not treated as
-// failures - they may still resolve, so the wake timeout bounds those.
-var ErrPodNotRunning = errors.New("backing pod not running")
+// ErrPodNotRunning reports that a managed pod is wedged in a state it will not
+// recover from on its own (bad/missing image, crash loop, bad config), so the
+// wake wait gave up early instead of holding the request until the wake timeout.
+// Transient startup states and unschedulable pods are not treated as failures -
+// they may still resolve, so the wake timeout bounds those.
+var ErrPodNotRunning = errors.New("managed pod not running")
 
 // Scaler performs sleep/wake/readiness operations against one namespace.
 type Scaler struct {
@@ -60,6 +58,7 @@ type workload struct {
 	kind     string
 	name     string
 	replicas int32 // current spec.replicas (nil treated as 1)
+	ready    int32 // status.readyReplicas
 	wake     int32 // wake-annotation value
 	hasWake  bool
 	patch    func(ctx context.Context, body []byte) error
@@ -156,66 +155,54 @@ func (s *Scaler) WakeAll(ctx context.Context) error {
 	return errs
 }
 
-// WaitForReady blocks until the named Service has at least one ready endpoint
-// address, a backing pod becomes wedged in a non-recoverable state (returning
-// ErrPodNotRunning so the caller can stop waiting early), or ctx is cancelled
-// (the caller sets the wake deadline on ctx).
-func (s *Scaler) WaitForReady(ctx context.Context, service string) error {
-	// Resolve the Service's pod selector once so we can spot pods that will never
-	// become ready (bad image, crash loop) and fail fast, rather than holding the
-	// request for the whole wake timeout. If the selector can't be read we skip
-	// the health check and let the timeout alone bound the wait.
-	selector := s.podSelector(ctx, service)
-
+// WaitForReady blocks until every managed workload in the namespace has all of
+// its replicas ready - so a request is held until the whole environment is up,
+// not just the Service it routes to (a web app must not be proxied before the
+// database it depends on is ready). It returns early with ErrPodNotRunning if a
+// managed pod becomes wedged in a non-recoverable state, or ctx is cancelled (the
+// caller sets the wake deadline on ctx).
+func (s *Scaler) WaitForReady(ctx context.Context) error {
 	ticker := time.NewTicker(readinessPollInterval)
 	defer ticker.Stop()
+	var pending []string
 	for {
-		ready, err := s.serviceReady(ctx, service)
+		notReady, err := s.pendingWorkloads(ctx)
 		if err != nil {
-			s.log.Warn("error checking service readiness", "service", service, "err", err)
-		} else if ready {
+			s.log.Warn("error checking workload readiness", "err", err)
+		} else if len(notReady) == 0 {
 			return nil
+		} else {
+			pending = notReady
 		}
-		if selector != "" {
-			if name, reason, failed := s.podFailure(ctx, selector); failed {
-				return fmt.Errorf("%w: %s (%s)", ErrPodNotRunning, name, reason)
-			}
+		// Don't hold the request for the full timeout when a managed pod is wedged
+		// (bad image, crash loop, ...): it won't become ready without a fix.
+		if name, reason, failed := s.podFailure(ctx); failed {
+			return fmt.Errorf("%w: %s (%s)", ErrPodNotRunning, name, reason)
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("waiting for service %q to become ready: %w", service, ctx.Err())
+			return fmt.Errorf("waiting for workloads to become ready (pending: %v): %w", pending, ctx.Err())
 		case <-ticker.C:
 		}
 	}
 }
 
-// serviceReady reports whether the Service has at least one ready, addressed
-// endpoint. It reads EndpointSlices (discovery.k8s.io/v1) - the modern
-// replacement for the deprecated core Endpoints API - selected by the
-// kubernetes.io/service-name label the EndpointSlice controller sets.
-func (s *Scaler) serviceReady(ctx context.Context, service string) (bool, error) {
-	slices, err := s.client.DiscoveryV1().EndpointSlices(s.namespace).List(ctx, metav1.ListOptions{
-		LabelSelector: discoveryv1.LabelServiceName + "=" + service,
-	})
+// pendingWorkloads returns the managed workloads (as "Kind/name") that are not
+// yet fully ready: fewer ready replicas than their desired count. A workload at
+// zero desired replicas is skipped (nothing to wait for). An empty result means
+// the namespace is ready.
+func (s *Scaler) pendingWorkloads(ctx context.Context) ([]string, error) {
+	workloads, err := s.listManaged(ctx)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	for i := range slices.Items {
-		slice := &slices.Items[i]
-		if slice.Labels[discoveryv1.LabelServiceName] != service {
-			continue
-		}
-		for _, endpoint := range slice.Endpoints {
-			// A nil Ready is "unknown"; per the API convention treat it as ready
-			// (and the proxy's dial-retry covers any remaining gap). Explicit
-			// false means the pod has not passed its readiness probe yet.
-			ready := endpoint.Conditions.Ready == nil || *endpoint.Conditions.Ready
-			if ready && len(endpoint.Addresses) > 0 {
-				return true, nil
-			}
+	var pending []string
+	for _, w := range workloads {
+		if w.replicas > 0 && w.ready < w.replicas {
+			pending = append(pending, w.kind+"/"+w.name)
 		}
 	}
-	return false, nil
+	return pending, nil
 }
 
 // fatalWaitingReasons are container "waiting" reasons that mean a pod will not
@@ -232,29 +219,14 @@ var fatalWaitingReasons = map[string]bool{
 	"CreateContainerConfigError": true,
 }
 
-// podSelector returns the label-selector string for a Service's pods, or "" if
-// the Service is missing, selector-less, or unreadable (callers then skip the
-// pod health check and rely on the wake timeout alone).
-func (s *Scaler) podSelector(ctx context.Context, service string) string {
-	svc, err := s.client.CoreV1().Services(s.namespace).Get(ctx, service, metav1.GetOptions{})
+// podFailure reports the first managed pod (matched by the same target selector
+// used for scaling) that is wedged in a non-recoverable state, with a short
+// reason for logging. A failure to list pods is logged and treated as "no
+// failure" so a transient API error never turns a healthy wake into an error.
+func (s *Scaler) podFailure(ctx context.Context) (name, reason string, failed bool) {
+	pods, err := s.client.CoreV1().Pods(s.namespace).List(ctx, metav1.ListOptions{LabelSelector: s.targetSelector})
 	if err != nil {
-		s.log.Warn("could not read service for pod health checks; relying on wake timeout", "service", service, "err", err)
-		return ""
-	}
-	if len(svc.Spec.Selector) == 0 {
-		return ""
-	}
-	return labels.SelectorFromSet(svc.Spec.Selector).String()
-}
-
-// podFailure reports the first pod matching selector that is wedged in a
-// non-recoverable state, with a short reason for logging. A failure to list pods
-// is logged and treated as "no failure" so a transient API error never turns a
-// healthy wake into an error.
-func (s *Scaler) podFailure(ctx context.Context, selector string) (name, reason string, failed bool) {
-	pods, err := s.client.CoreV1().Pods(s.namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})
-	if err != nil {
-		s.log.Warn("error listing pods for health check", "selector", selector, "err", err)
+		s.log.Warn("error listing pods for health check", "err", err)
 		return "", "", false
 	}
 	for i := range pods.Items {
@@ -315,6 +287,7 @@ func (s *Scaler) listManaged(ctx context.Context) ([]workload, error) {
 			kind:     "Deployment",
 			name:     name,
 			replicas: derefReplicas(d.Spec.Replicas),
+			ready:    d.Status.ReadyReplicas,
 			wake:     wake,
 			hasWake:  hasWake,
 			patch: func(ctx context.Context, body []byte) error {
@@ -334,6 +307,7 @@ func (s *Scaler) listManaged(ctx context.Context) ([]workload, error) {
 			kind:     "StatefulSet",
 			name:     name,
 			replicas: derefReplicas(st.Spec.Replicas),
+			ready:    st.Status.ReadyReplicas,
 			wake:     wake,
 			hasWake:  hasWake,
 			patch: func(ctx context.Context, body []byte) error {

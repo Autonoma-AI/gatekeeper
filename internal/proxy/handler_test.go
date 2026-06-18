@@ -31,7 +31,7 @@ func (f *fakeWaker) EnsureAwake(context.Context) error { f.ensureCalls++; return
 
 type fakeReadiness struct{ calls int }
 
-func (f *fakeReadiness) WaitForReady(context.Context, string) error { f.calls++; return nil }
+func (f *fakeReadiness) WaitForReady(context.Context) error { f.calls++; return nil }
 
 type fakeToucher struct{ calls int }
 

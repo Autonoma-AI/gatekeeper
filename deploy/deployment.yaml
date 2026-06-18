@@ -44,6 +44,8 @@ spec:
               value: "gatekeeper.dev/scale-to-zero=true"
             - name: SELF_NAME
               value: "gatekeeper"
+            # Idle duration before scale-to-zero. Set to "0" to disable scale-to-zero
+            # (run as a pure wake-on-request proxy; the namespace is never auto-slept).
             - name: IDLE_TIMEOUT
               value: "30m"
             # HEALTH_PATH MUST equal the readinessProbe path below (and any livenessProbe).
