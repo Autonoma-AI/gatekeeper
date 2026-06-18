@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -36,32 +37,37 @@ type Scaler struct {
 	targetSelector string
 	selfName       string
 	wakeAnnotation string
+	dependsOnAnno  string
 	log            *slog.Logger
 }
 
 // New builds a Scaler. targetSelector is the label selector for managed workloads
 // (empty = all); selfName is the workload name to never scale (Gatekeeper itself);
-// wakeAnnotation is the annotation key used to remember a workload's replica count.
-func New(client kubernetes.Interface, namespace, targetSelector, selfName, wakeAnnotation string, log *slog.Logger) *Scaler {
+// wakeAnnotation is the annotation key used to remember a workload's replica count;
+// dependsOnAnnotation is the annotation key listing a workload's dependencies (used
+// to order wake-up).
+func New(client kubernetes.Interface, namespace, targetSelector, selfName, wakeAnnotation, dependsOnAnnotation string, log *slog.Logger) *Scaler {
 	return &Scaler{
 		client:         client,
 		namespace:      namespace,
 		targetSelector: targetSelector,
 		selfName:       selfName,
 		wakeAnnotation: wakeAnnotation,
+		dependsOnAnno:  dependsOnAnnotation,
 		log:            log,
 	}
 }
 
 // workload is a uniform view over a Deployment or StatefulSet for sleep/wake.
 type workload struct {
-	kind     string
-	name     string
-	replicas int32 // current spec.replicas (nil treated as 1)
-	ready    int32 // status.readyReplicas
-	wake     int32 // wake-annotation value
-	hasWake  bool
-	patch    func(ctx context.Context, body []byte) error
+	kind      string
+	name      string
+	replicas  int32 // current spec.replicas (nil treated as 1)
+	ready     int32 // status.readyReplicas
+	wake      int32 // wake-annotation value
+	hasWake   bool
+	dependsOn []string // names of workloads this one must wake after
+	patch     func(ctx context.Context, body []byte) error
 }
 
 // IsAsleep reports whether every managed (non-self) workload is at zero replicas.
@@ -117,42 +123,112 @@ func (s *Scaler) SleepAll(ctx context.Context) error {
 }
 
 // WakeAll restores every zero-replica managed workload to its saved replica count
-// (defaulting to 1 when the annotation is missing or invalid).
+// (defaulting to 1 when the annotation is missing or invalid). Workloads are woken
+// in dependency order: each wave is scaled up and waited on until ready before the
+// next wave (which depends on it) is scaled, so an app never starts before the
+// database it depends on. With no dependencies declared this is a single wave -
+// every workload scaled at once, exactly as before.
 func (s *Scaler) WakeAll(ctx context.Context) error {
 	workloads, err := s.listManaged(ctx)
 	if err != nil {
 		return err
 	}
+	waves := dependencyWaves(workloads, s.log)
 	var errs error
 	woken := 0
-	for _, w := range workloads {
-		if w.replicas != 0 {
-			continue
-		}
-		target := int32(1)
-		if w.hasWake && w.wake > 0 {
-			target = w.wake
-		} else {
-			s.log.Warn("missing/invalid wake annotation; defaulting to 1", "kind", w.kind, "name", w.name)
-		}
-		body, err := replicasPatch(target)
-		if err != nil {
-			errs = errors.Join(errs, fmt.Errorf("build wake patch for %s/%s: %w", w.kind, w.name, err))
-			continue
-		}
-		if err := w.patch(ctx, body); err != nil {
-			if apierrors.IsNotFound(err) {
-				s.log.Warn("workload vanished during wake; skipping", "kind", w.kind, "name", w.name)
+	for i, wave := range waves {
+		want := make(map[string]bool, len(wave))
+		for _, w := range wave {
+			want[w.name] = true
+			if w.replicas != 0 {
+				continue // already awake; we still wait for it below
+			}
+			target := int32(1)
+			if w.hasWake && w.wake > 0 {
+				target = w.wake
+			} else {
+				s.log.Warn("missing/invalid wake annotation; defaulting to 1", "kind", w.kind, "name", w.name)
+			}
+			body, err := replicasPatch(target)
+			if err != nil {
+				errs = errors.Join(errs, fmt.Errorf("build wake patch for %s/%s: %w", w.kind, w.name, err))
 				continue
 			}
-			errs = errors.Join(errs, fmt.Errorf("scale %s/%s to %d: %w", w.kind, w.name, target, err))
-			continue
+			if err := w.patch(ctx, body); err != nil {
+				if apierrors.IsNotFound(err) {
+					s.log.Warn("workload vanished during wake; skipping", "kind", w.kind, "name", w.name)
+					continue
+				}
+				errs = errors.Join(errs, fmt.Errorf("scale %s/%s to %d: %w", w.kind, w.name, target, err))
+				continue
+			}
+			woken++
+			s.log.Info("scaled workload up", "kind", w.kind, "name", w.name, "replicas", target, "wave", i)
 		}
-		woken++
-		s.log.Info("scaled workload up", "kind", w.kind, "name", w.name, "replicas", target)
+		// Gate the next wave on this one being ready, so dependents never start
+		// before their dependencies. The final wave's readiness is left to the
+		// caller's WaitForReady (which waits for the whole namespace).
+		if i < len(waves)-1 {
+			if err := s.awaitReady(ctx, want); err != nil {
+				return errors.Join(errs, fmt.Errorf("waiting for dependency wave %d/%d: %w", i+1, len(waves), err))
+			}
+		}
 	}
-	s.log.Info("wake complete", "woken", woken, "managed", len(workloads))
+	s.log.Info("wake complete", "woken", woken, "managed", len(workloads), "waves", len(waves))
 	return errs
+}
+
+// dependencyWaves orders managed workloads into waves where every workload appears
+// in a later wave than each of its dependencies (the depends-on annotation), and
+// workloads in the same wave have no ordering constraint. Dependencies naming an
+// unmanaged workload are ignored. A dependency cycle cannot be ordered, so all
+// workloads collapse into a single wave (woken at once) with a warning.
+func dependencyWaves(workloads []workload, log *slog.Logger) [][]workload {
+	byName := make(map[string]workload, len(workloads))
+	for _, w := range workloads {
+		byName[w.name] = w
+	}
+	indeg := make(map[string]int, len(workloads))
+	dependents := make(map[string][]string, len(workloads))
+	for _, w := range workloads {
+		for _, dep := range w.dependsOn {
+			if _, ok := byName[dep]; !ok {
+				continue // dependency isn't a managed workload here; nothing to wait on
+			}
+			indeg[w.name]++
+			dependents[dep] = append(dependents[dep], w.name)
+		}
+	}
+
+	var current []workload
+	for _, w := range workloads {
+		if indeg[w.name] == 0 {
+			current = append(current, w)
+		}
+	}
+
+	var waves [][]workload
+	placed := 0
+	for len(current) > 0 {
+		waves = append(waves, current)
+		placed += len(current)
+		var next []workload
+		for _, w := range current {
+			for _, name := range dependents[w.name] {
+				indeg[name]--
+				if indeg[name] == 0 {
+					next = append(next, byName[name])
+				}
+			}
+		}
+		current = next
+	}
+
+	if placed != len(workloads) {
+		log.Warn("dependency cycle among managed workloads; waking all at once")
+		return [][]workload{workloads}
+	}
+	return waves
 }
 
 // WaitForReady blocks until every managed workload in the namespace has all of
@@ -162,11 +238,18 @@ func (s *Scaler) WakeAll(ctx context.Context) error {
 // managed pod becomes wedged in a non-recoverable state, or ctx is cancelled (the
 // caller sets the wake deadline on ctx).
 func (s *Scaler) WaitForReady(ctx context.Context) error {
+	return s.awaitReady(ctx, nil)
+}
+
+// awaitReady blocks until every managed workload named in want (or every managed
+// workload, when want is nil) has all of its replicas ready, a managed pod becomes
+// wedged (ErrPodNotRunning), or ctx is cancelled.
+func (s *Scaler) awaitReady(ctx context.Context, want map[string]bool) error {
 	ticker := time.NewTicker(readinessPollInterval)
 	defer ticker.Stop()
 	var pending []string
 	for {
-		notReady, err := s.pendingWorkloads(ctx)
+		notReady, err := s.pendingWorkloads(ctx, want)
 		if err != nil {
 			s.log.Warn("error checking workload readiness", "err", err)
 		} else if len(notReady) == 0 {
@@ -187,17 +270,21 @@ func (s *Scaler) WaitForReady(ctx context.Context) error {
 	}
 }
 
-// pendingWorkloads returns the managed workloads (as "Kind/name") that are not
-// yet fully ready: fewer ready replicas than their desired count. A workload at
-// zero desired replicas is skipped (nothing to wait for). An empty result means
-// the namespace is ready.
-func (s *Scaler) pendingWorkloads(ctx context.Context) ([]string, error) {
+// pendingWorkloads returns the managed workloads (as "Kind/name") that are not yet
+// fully ready: fewer ready replicas than desired. When want is non-nil only the
+// workloads named in it are considered. A workload at zero desired replicas is
+// skipped (nothing to wait for). An empty result means the considered workloads
+// are ready.
+func (s *Scaler) pendingWorkloads(ctx context.Context, want map[string]bool) ([]string, error) {
 	workloads, err := s.listManaged(ctx)
 	if err != nil {
 		return nil, err
 	}
 	var pending []string
 	for _, w := range workloads {
+		if want != nil && !want[w.name] {
+			continue
+		}
 		if w.replicas > 0 && w.ready < w.replicas {
 			pending = append(pending, w.kind+"/"+w.name)
 		}
@@ -284,12 +371,13 @@ func (s *Scaler) listManaged(ctx context.Context) ([]workload, error) {
 		name := d.Name
 		wake, hasWake := parseWake(s.wakeAnnotation, d.Annotations)
 		workloads = append(workloads, workload{
-			kind:     "Deployment",
-			name:     name,
-			replicas: derefReplicas(d.Spec.Replicas),
-			ready:    d.Status.ReadyReplicas,
-			wake:     wake,
-			hasWake:  hasWake,
+			kind:      "Deployment",
+			name:      name,
+			replicas:  derefReplicas(d.Spec.Replicas),
+			ready:     d.Status.ReadyReplicas,
+			wake:      wake,
+			hasWake:   hasWake,
+			dependsOn: parseDependsOn(s.dependsOnAnno, d.Annotations),
 			patch: func(ctx context.Context, body []byte) error {
 				_, err := s.client.AppsV1().Deployments(s.namespace).Patch(ctx, name, types.MergePatchType, body, metav1.PatchOptions{})
 				return err
@@ -304,12 +392,13 @@ func (s *Scaler) listManaged(ctx context.Context) ([]workload, error) {
 		name := st.Name
 		wake, hasWake := parseWake(s.wakeAnnotation, st.Annotations)
 		workloads = append(workloads, workload{
-			kind:     "StatefulSet",
-			name:     name,
-			replicas: derefReplicas(st.Spec.Replicas),
-			ready:    st.Status.ReadyReplicas,
-			wake:     wake,
-			hasWake:  hasWake,
+			kind:      "StatefulSet",
+			name:      name,
+			replicas:  derefReplicas(st.Spec.Replicas),
+			ready:     st.Status.ReadyReplicas,
+			wake:      wake,
+			hasWake:   hasWake,
+			dependsOn: parseDependsOn(s.dependsOnAnno, st.Annotations),
 			patch: func(ctx context.Context, body []byte) error {
 				_, err := s.client.AppsV1().StatefulSets(s.namespace).Patch(ctx, name, types.MergePatchType, body, metav1.PatchOptions{})
 				return err
@@ -333,6 +422,23 @@ func sleepPatch(annotation string, current int32) ([]byte, error) {
 func replicasPatch(n int32) ([]byte, error) {
 	body := map[string]any{"spec": map[string]any{"replicas": n}}
 	return json.Marshal(body)
+}
+
+// parseDependsOn reads the comma-separated dependency annotation into workload
+// names, trimming whitespace and dropping empties. A missing annotation yields no
+// dependencies.
+func parseDependsOn(annotation string, annotations map[string]string) []string {
+	raw := annotations[annotation]
+	if raw == "" {
+		return nil
+	}
+	var deps []string
+	for _, part := range strings.Split(raw, ",") {
+		if name := strings.TrimSpace(part); name != "" {
+			deps = append(deps, name)
+		}
+	}
+	return deps
 }
 
 func parseWake(annotation string, annotations map[string]string) (int32, bool) {

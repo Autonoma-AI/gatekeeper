@@ -52,6 +52,10 @@ type Config struct {
 	TargetSelector         string
 	SelfName               string
 	WakeReplicasAnnotation string
+	// DependsOnAnnotation is the annotation key whose comma-separated value lists
+	// the workloads a workload depends on. Gatekeeper wakes workloads in dependency
+	// order (dependencies first), so an app is not started before its database.
+	DependsOnAnnotation string
 
 	HealthPath string
 	LogLevel   string
@@ -80,6 +84,7 @@ func Load() (*Config, error) {
 		TargetSelector:         stringEnv("TARGET_SELECTOR", "gatekeeper.dev/scale-to-zero=true"),
 		SelfName:               stringEnv("SELF_NAME", "gatekeeper"),
 		WakeReplicasAnnotation: stringEnv("WAKE_REPLICAS_ANNOTATION", "gatekeeper.dev/wake-replicas"),
+		DependsOnAnnotation:    stringEnv("DEPENDS_ON_ANNOTATION", "gatekeeper.dev/depends-on"),
 		HealthPath:             stringEnv("HEALTH_PATH", "/healthz"),
 		LogLevel:               stringEnv("LOG_LEVEL", "info"),
 	}

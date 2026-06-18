@@ -53,6 +53,9 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.SelfName != "gatekeeper" || cfg.WakeReplicasAnnotation != "gatekeeper.dev/wake-replicas" {
 		t.Errorf("self/annotation defaults = %q / %q", cfg.SelfName, cfg.WakeReplicasAnnotation)
 	}
+	if cfg.DependsOnAnnotation != "gatekeeper.dev/depends-on" {
+		t.Errorf("DependsOnAnnotation default = %q", cfg.DependsOnAnnotation)
+	}
 	if cfg.HealthPath != "/healthz" || cfg.AuthCallbackPath != "/_gatekeeper/auth" {
 		t.Errorf("path defaults = %q / %q", cfg.HealthPath, cfg.AuthCallbackPath)
 	}

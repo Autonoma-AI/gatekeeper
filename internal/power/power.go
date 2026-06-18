@@ -72,8 +72,9 @@ func (m *Manager) Sleep(ctx context.Context) error {
 // EnsureAwake wakes the namespace if asleep, coalescing concurrent callers into
 // a single WakeAll via singleflight. WakeAll runs on a context detached from the
 // caller's (a disconnecting client must not abort a wake the others are waiting
-// on) but bounded by wakeTimeout. It returns once replica counts are restored;
-// callers then wait for their specific upstream to become ready.
+// on) but bounded by wakeTimeout. It returns once every workload has been scaled
+// up in dependency order (each tier waited on before the next); callers then wait
+// for the whole namespace to become ready.
 func (m *Manager) EnsureAwake(ctx context.Context) error {
 	if !m.Asleep() {
 		return nil

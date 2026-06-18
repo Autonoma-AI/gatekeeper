@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"reflect"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ const (
 	testNS   = "demo"
 	selfName = "gatekeeper"
 	wakeAnn  = "gatekeeper.dev/wake-replicas"
+	depAnn   = "gatekeeper.dev/depends-on"
 )
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -41,7 +43,7 @@ func statefulSet(name string, replicas int32, ann map[string]string) *appsv1.Sta
 
 // empty selector = all workloads in the namespace; self excluded by name.
 func newScaler(client kubernetes.Interface) *Scaler {
-	return New(client, testNS, "", selfName, wakeAnn, testLogger())
+	return New(client, testNS, "", selfName, wakeAnn, depAnn, testLogger())
 }
 
 func getDeploy(t *testing.T, c kubernetes.Interface, name string) *appsv1.Deployment {
@@ -267,4 +269,82 @@ func TestPodFatalReason(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDependencyWaves(t *testing.T) {
+	wl := func(name string, deps ...string) workload { return workload{name: name, dependsOn: deps} }
+	waveNames := func(waves [][]workload) [][]string {
+		out := make([][]string, len(waves))
+		for i, wave := range waves {
+			for _, w := range wave {
+				out[i] = append(out[i], w.name)
+			}
+		}
+		return out
+	}
+
+	t.Run("no dependencies is a single wave", func(t *testing.T) {
+		waves := dependencyWaves([]workload{wl("web"), wl("api")}, testLogger())
+		if len(waves) != 1 || len(waves[0]) != 2 {
+			t.Fatalf("waves = %v, want one wave of two", waveNames(waves))
+		}
+	})
+	t.Run("orders dependencies before dependents", func(t *testing.T) {
+		// web depends on api, api depends on db -> db, then api, then web.
+		got := waveNames(dependencyWaves([]workload{wl("web", "api"), wl("api", "db"), wl("db")}, testLogger()))
+		want := [][]string{{"db"}, {"api"}, {"web"}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("waves = %v, want %v", got, want)
+		}
+	})
+	t.Run("ignores dependencies on unmanaged workloads", func(t *testing.T) {
+		waves := dependencyWaves([]workload{wl("web", "external")}, testLogger())
+		if len(waves) != 1 {
+			t.Fatalf("waves = %v, want a single wave (unknown dep ignored)", waveNames(waves))
+		}
+	})
+	t.Run("a cycle collapses to one wave", func(t *testing.T) {
+		waves := dependencyWaves([]workload{wl("a", "b"), wl("b", "a")}, testLogger())
+		if len(waves) != 1 || len(waves[0]) != 2 {
+			t.Fatalf("waves = %v, want one wave (cycle fallback)", waveNames(waves))
+		}
+	})
+}
+
+func TestWakeAllOrdersByDependency(t *testing.T) {
+	dependsOnDB := map[string]string{depAnn: "db"}
+
+	t.Run("does not wake a dependent until its dependency is ready", func(t *testing.T) {
+		// db is scaled up but never reports ready (no controller in the fake), so
+		// web (which depends on db) must not be scaled before the wake times out.
+		client := fake.NewSimpleClientset(
+			deploy("db", 0, nil),
+			deploy("web", 0, dependsOnDB),
+		)
+		ctx, cancel := context.WithTimeout(context.Background(), 80*time.Millisecond)
+		defer cancel()
+		if err := newScaler(client).WakeAll(ctx); err == nil {
+			t.Fatal("expected WakeAll to error: db never becomes ready")
+		}
+		if db := getDeploy(t, client, "db"); *db.Spec.Replicas != 1 {
+			t.Errorf("db replicas = %d, want 1 (first wave scaled)", *db.Spec.Replicas)
+		}
+		if web := getDeploy(t, client, "web"); *web.Spec.Replicas != 0 {
+			t.Errorf("web replicas = %d, want 0 (must wait for db to be ready)", *web.Spec.Replicas)
+		}
+	})
+	t.Run("wakes the dependent once the dependency is ready", func(t *testing.T) {
+		client := fake.NewSimpleClientset(
+			deployReady("db", 1, 1), // already awake and ready
+			deploy("web", 0, dependsOnDB),
+		)
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		if err := newScaler(client).WakeAll(ctx); err != nil {
+			t.Fatalf("WakeAll: %v", err)
+		}
+		if web := getDeploy(t, client, "web"); *web.Spec.Replicas != 1 {
+			t.Errorf("web replicas = %d, want 1 (db ready, so web is scaled)", *web.Spec.Replicas)
+		}
+	})
 }

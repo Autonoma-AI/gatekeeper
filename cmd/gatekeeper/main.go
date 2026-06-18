@@ -73,7 +73,7 @@ func run() error {
 	table := routing.NewTable(cfg.Namespace, cfg.Routes)
 	gate := auth.NewGate(cfg.AuthToken, cfg.AuthHeader, cfg.AuthCookie, cfg.LoginURL)
 	callbackHTML := auth.AuthCallbackPage(cfg.AuthCookie, cfg.CookieDomain)
-	sc := scaler.New(clientset, cfg.Namespace, cfg.TargetSelector, cfg.SelfName, cfg.WakeReplicasAnnotation, log)
+	sc := scaler.New(clientset, cfg.Namespace, cfg.TargetSelector, cfg.SelfName, cfg.WakeReplicasAnnotation, cfg.DependsOnAnnotation, log)
 	pw := power.New(sc, cfg.WakeTimeout, log)
 	tracker := activity.NewTracker()
 
