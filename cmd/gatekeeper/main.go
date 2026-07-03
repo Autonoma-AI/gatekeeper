@@ -117,8 +117,14 @@ func run() error {
 
 	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.WakeTimeout, log)
 
-	loop := idle.New(reg, cfg.IdleCheckInterval, log)
-	go loop.Run(ctx)
+	// With scale-to-zero disabled every Env's idle timeout is 0, so the loop
+	// could never sleep anything; don't start it (this also keeps the legacy
+	// IDLE_TIMEOUT=0 + IDLE_CHECK_INTERVAL=0 config working, as before).
+	if cfg.ScaleToZeroEnabled() {
+		go idle.New(reg, cfg.IdleCheckInterval, log).Run(ctx)
+	} else {
+		log.Info("scale-to-zero disabled (idle timeout <= 0); idle loop not started")
+	}
 
 	server := &http.Server{
 		Addr:    ":" + strconv.Itoa(cfg.Port),

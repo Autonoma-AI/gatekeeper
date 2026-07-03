@@ -24,7 +24,8 @@ type Config struct {
 	Namespace string
 	// PodNamespace is the namespace Gatekeeper itself runs in (inject via the
 	// downward API); SELF_NAME is only excluded from scaling there. Falls back
-	// to Namespace, which is where legacy single-namespace deployments run.
+	// to Namespace, which is where legacy single-namespace deployments run;
+	// required when Namespace is empty so self-exclusion never silently lapses.
 	PodNamespace string
 
 	// Routes maps an incoming hostname to the in-cluster Service that serves
@@ -124,8 +125,16 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
+	// Without its own namespace Gatekeeper cannot exclude itself from scaling:
+	// a selector matching the Gatekeeper pod would then scale it to zero.
+	if c.PodNamespace == "" {
+		return errors.New("POD_NAMESPACE is required when NAMESPACE is not set (inject it via the downward API)")
+	}
 	if len(c.Routes) == 0 {
 		return errors.New("ROUTES_JSON must define at least one host -> upstream mapping")
+	}
+	if c.ScaleToZeroEnabled() && c.IdleCheckInterval <= 0 {
+		return errors.New("IDLE_CHECK_INTERVAL must be > 0 when scale-to-zero is enabled (IDLE_TIMEOUT > 0)")
 	}
 	return nil
 }

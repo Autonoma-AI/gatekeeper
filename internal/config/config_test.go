@@ -107,6 +107,7 @@ func TestLoadNamespaceRequirements(t *testing.T) {
 	})
 	t.Run("per-route namespaces make NAMESPACE optional", func(t *testing.T) {
 		t.Setenv("NAMESPACE", "")
+		t.Setenv("POD_NAMESPACE", "system")
 		t.Setenv("ROUTES_JSON", `{"web.example.test":{"namespace":"ns-a","service":"web","port":3000}}`)
 		cfg, err := Load()
 		if err != nil {
@@ -114,6 +115,14 @@ func TestLoadNamespaceRequirements(t *testing.T) {
 		}
 		if got := cfg.Routes["web.example.test"].Namespace; got != "ns-a" {
 			t.Fatalf("route namespace = %q, want ns-a", got)
+		}
+	})
+	t.Run("without NAMESPACE, POD_NAMESPACE is required", func(t *testing.T) {
+		t.Setenv("NAMESPACE", "")
+		t.Setenv("POD_NAMESPACE", "")
+		t.Setenv("ROUTES_JSON", `{"web.example.test":{"namespace":"ns-a","service":"web","port":3000}}`)
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error: self-exclusion needs POD_NAMESPACE (or NAMESPACE)")
 		}
 	})
 	t.Run("missing routes", func(t *testing.T) {
@@ -182,4 +191,22 @@ func TestLoadInvalidDuration(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for invalid IDLE_TIMEOUT")
 	}
+}
+
+func TestIdleCheckInterval(t *testing.T) {
+	t.Run("zero interval with scale-to-zero enabled is a config error", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("IDLE_CHECK_INTERVAL", "0")
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error: the idle loop cannot tick on a zero interval")
+		}
+	})
+	t.Run("zero interval is fine when scale-to-zero is disabled", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("IDLE_TIMEOUT", "0")
+		t.Setenv("IDLE_CHECK_INTERVAL", "0")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load: %v (IDLE_TIMEOUT=0 deployments may zero the interval too)", err)
+		}
+	})
 }
