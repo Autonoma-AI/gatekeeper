@@ -45,6 +45,15 @@ func (t *Table) Resolve(hostHeader string) (Upstream, bool) {
 	return up, ok
 }
 
+// Hosts returns a copy of the full host -> upstream table.
+func (t *Table) Hosts() map[string]Upstream {
+	hosts := make(map[string]Upstream, len(t.routes))
+	for host, up := range t.routes {
+		hosts[host] = up
+	}
+	return hosts
+}
+
 func normalizeHost(hostHeader string) string {
 	host := strings.ToLower(strings.TrimSpace(hostHeader))
 	// Host may carry a :port suffix (e.g. "app.example.com:443"); strip it.

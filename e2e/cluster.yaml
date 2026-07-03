@@ -1,8 +1,9 @@
 # End-to-end harness for CLUSTER MODE on a local cluster: one Gatekeeper
-# Deployment (3 replicas, leader election) in its own namespace managing two
-# app namespaces via explicit per-route namespaces - no NAMESPACE env at all.
-# Auth is off here (the single-namespace suite covers it); this suite focuses
-# on leader election, label steering, and failover.
+# Deployment (3 replicas, leader election) in its own namespace DISCOVERING
+# two labeled app namespaces, whose routes live in their annotations - no
+# ROUTES_JSON, no NAMESPACE env at all. Auth is off here (the single-namespace
+# suite covers it); this suite focuses on discovery, leader election, label
+# steering, and failover.
 #
 # Apply with `e2e/run-cluster.sh`, or by hand:
 #   kubectl --context orbstack apply -f e2e/cluster.yaml
@@ -16,11 +17,21 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: gatekeeper-e2e-a
+  labels:
+    gatekeeper.dev/managed: "true"
+  annotations:
+    gatekeeper.dev/routes: |
+      { "whoami-a.example.test": { "service": "whoami", "port": 80 } }
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: gatekeeper-e2e-b
+  labels:
+    gatekeeper.dev/managed: "true"
+  annotations:
+    gatekeeper.dev/routes: |
+      { "whoami-b.example.test": { "service": "whoami", "port": 80 } }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -141,6 +152,12 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list"]
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -182,18 +199,6 @@ subjects:
     name: gatekeeper
     namespace: gatekeeper-e2e-sys
 ---
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: gatekeeper-routes
-  namespace: gatekeeper-e2e-sys
-data:
-  routes.json: |
-    {
-      "whoami-a.example.test": { "namespace": "gatekeeper-e2e-a", "service": "whoami", "port": 80 },
-      "whoami-b.example.test": { "namespace": "gatekeeper-e2e-b", "service": "whoami", "port": 80 }
-    }
----
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -229,11 +234,8 @@ spec:
                   fieldPath: metadata.namespace
             - name: LEADER_ELECTION
               value: "true"
-            - name: ROUTES_JSON
-              valueFrom:
-                configMapKeyRef:
-                  name: gatekeeper-routes
-                  key: routes.json
+            - name: NAMESPACE_SELECTOR
+              value: "gatekeeper.dev/managed=true"
             # Short timers so the sleep/wake cycle is easy to observe in a test run.
             - name: IDLE_TIMEOUT
               value: "20s"

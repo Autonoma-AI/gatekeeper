@@ -6,6 +6,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -23,11 +24,18 @@ import (
 )
 
 // Resolver maps a request's Host header to the upstream that serves it and the
-// managed namespace (Env) the upstream belongs to (implemented by
-// *registry.Registry).
+// managed namespace (Env) the upstream belongs to, and reports the live
+// routing table for the debug endpoint (implemented by *registry.Registry).
 type Resolver interface {
 	Resolve(host string) (*registry.Env, routing.Upstream, bool)
+	Status() []registry.RouteStatus
 }
+
+// routesStatusPath serves the live routing table + per-namespace power state
+// as JSON. Unlike the health/ready paths it sits behind the auth gate: it is
+// an operator debug surface, needed because discovery mode has no single
+// config object to inspect.
+const routesStatusPath = "/_gatekeeper/routes"
 
 // Handler implements http.Handler for all traffic across the managed namespaces.
 type Handler struct {
@@ -110,6 +118,19 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, h.callbackHTML)
+		return
+	}
+
+	// 2b. Live routing table for operators - authenticated, but served by
+	//     every replica (standbys keep a warm informer cache worth inspecting).
+	if r.URL.Path == routesStatusPath {
+		if !h.gate.Authorized(r) {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		_ = json.NewEncoder(w).Encode(h.resolver.Status())
 		return
 	}
 

@@ -139,6 +139,51 @@ Service, ClusterRole + leader Role).
 | `LEASE_NAME` | `gatekeeper` | Lease object name, created in `POD_NAMESPACE`. |
 | `READY_PATH` | `/readyz` | Readiness probe path; must differ from `HEALTH_PATH` (liveness stays unconditional). |
 
+### Namespace discovery (optional)
+
+Instead of a static `ROUTES_JSON`, set `NAMESPACE_SELECTOR` and Gatekeeper
+**discovers** its namespaces: it watches Namespaces matching the selector and
+reads each one's routes from an annotation. Create a labeled+annotated
+namespace and it is routable within milliseconds; delete or unlabel it and its
+routes vanish with it. There is no central routes object to keep in sync (and
+so no concurrent writers fighting over one).
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: preview-pr-12
+  labels:
+    gatekeeper.dev/managed: "true"          # must match NAMESPACE_SELECTOR
+  annotations:
+    gatekeeper.dev/routes: |                # same shape as ROUTES_JSON values
+      { "app-pr12.example.com": { "service": "web", "port": 3000 } }
+    gatekeeper.dev/idle-timeout: "45m"      # optional per-namespace override
+```
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `NAMESPACE_SELECTOR` | *(empty = static mode)* | Label selector for managed namespaces. Mutually exclusive with `ROUTES_JSON`. |
+| `ROUTES_ANNOTATION` | `gatekeeper.dev/routes` | Annotation holding a namespace's routes JSON. |
+| `IDLE_TIMEOUT_ANNOTATION` | `gatekeeper.dev/idle-timeout` | Per-namespace idle override (Go duration; `0` disables auto-sleep for that namespace). |
+
+Rules worth knowing:
+
+- An annotation's routes always target **its own namespace** - a `namespace`
+  field in the annotation is rejected, so annotating your namespace can never
+  steer traffic into someone else's.
+- A labeled namespace with a missing/malformed annotation is **skipped with a
+  warning and a Kubernetes Event** on the Namespace (`kubectl get events -n
+  default --field-selector involvedObject.name=<ns>`); other namespaces are
+  unaffected.
+- If two namespaces claim the same host, the **oldest namespace wins**,
+  deterministically; the loser gets an Event.
+- `GET /_gatekeeper/routes` (authenticated when auth is on) returns the live
+  routing table and each namespace's awake/asleep state - the discovery-mode
+  replacement for eyeballing a routes ConfigMap.
+- RBAC: add cluster-wide `namespaces get,list,watch` and `events create,patch`
+  (included in `deploy/cluster/rbac.yaml`).
+
 ### Authentication (optional)
 
 Authentication is **off** unless `AUTH_TOKEN` is set - Gatekeeper is then a plain

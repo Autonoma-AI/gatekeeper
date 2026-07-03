@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"net/http"
@@ -49,7 +50,7 @@ func handlerWith(gate *auth.Gate, pw *fakePower, rd *fakeReadiness, act *fakeAct
 	})
 	reg.Rebuild(map[string]routing.Upstream{
 		testHost: {Namespace: "test-ns", Service: "web", Port: 3000},
-	})
+	}, nil)
 	return NewHandler(reg, gate, "<html>callback</html>", "/_gatekeeper/auth", "/healthz", "/readyz", nil, nil, 2*time.Second, testLogger())
 }
 
@@ -98,6 +99,33 @@ func TestReadyPathFollowsGate(t *testing.T) {
 	}
 }
 
+// The routes debug endpoint is auth-gated (it is an operator surface, not a
+// probe) and reports the live table as JSON.
+func TestRoutesStatusEndpoint(t *testing.T) {
+	h := handlerWith(enabledGate(""), &fakePower{asleep: true}, &fakeReadiness{}, &fakeActivity{})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/_gatekeeper/routes", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated routes status = %d, want 401", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://"+testHost+"/_gatekeeper/routes", nil)
+	req.Header.Set(testHeader, testToken)
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("authenticated routes status = %d, want 200", rec.Code)
+	}
+	var statuses []registry.RouteStatus
+	if err := json.Unmarshal(rec.Body.Bytes(), &statuses); err != nil {
+		t.Fatalf("response is not JSON: %v (%q)", err, rec.Body.String())
+	}
+	if len(statuses) != 1 || statuses[0].Host != testHost || statuses[0].Namespace != "test-ns" || !statuses[0].Asleep {
+		t.Fatalf("statuses = %+v, want one asleep entry for %s", statuses, testHost)
+	}
+}
+
 // A replica that may not serve (standby, or a restarted pod still wearing a
 // stale leader label) fails closed on proxied paths but keeps answering
 // probes, so kubelet never restarts a healthy standby.
@@ -107,7 +135,7 @@ func TestStandbyFailsClosed(t *testing.T) {
 	reg := registry.New(func(ns string) *registry.Env {
 		return &registry.Env{Namespace: ns, Power: &fakePower{}, Readiness: &fakeReadiness{}, Activity: act}
 	})
-	reg.Rebuild(map[string]routing.Upstream{testHost: {Namespace: "test-ns", Service: "web", Port: 3000}})
+	reg.Rebuild(map[string]routing.Upstream{testHost: {Namespace: "test-ns", Service: "web", Port: 3000}}, nil)
 	h := NewHandler(reg, disabledGate(), "", "/_gatekeeper/auth", "/healthz", "/readyz", nil,
 		func() bool { return serving }, time.Second, testLogger())
 

@@ -242,6 +242,39 @@ func TestLeaderElectionConfig(t *testing.T) {
 	})
 }
 
+func TestDiscoveryConfig(t *testing.T) {
+	t.Run("selector enables discovery without routes", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "system")
+		t.Setenv("NAMESPACE_SELECTOR", "gatekeeper.dev/managed=true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.DiscoveryEnabled() || len(cfg.Routes) != 0 {
+			t.Fatalf("DiscoveryEnabled=%v routes=%d", cfg.DiscoveryEnabled(), len(cfg.Routes))
+		}
+		if cfg.RoutesAnnotation != "gatekeeper.dev/routes" || cfg.IdleTimeoutAnnotation != "gatekeeper.dev/idle-timeout" {
+			t.Errorf("annotation defaults = %q / %q", cfg.RoutesAnnotation, cfg.IdleTimeoutAnnotation)
+		}
+	})
+	t.Run("selector and ROUTES_JSON are mutually exclusive", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("NAMESPACE_SELECTOR", "gatekeeper.dev/managed=true")
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error: NAMESPACE_SELECTOR with ROUTES_JSON")
+		}
+	})
+	t.Run("discovery requires a positive check interval even with IDLE_TIMEOUT=0", func(t *testing.T) {
+		t.Setenv("POD_NAMESPACE", "system")
+		t.Setenv("NAMESPACE_SELECTOR", "gatekeeper.dev/managed=true")
+		t.Setenv("IDLE_TIMEOUT", "0")
+		t.Setenv("IDLE_CHECK_INTERVAL", "0")
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error: per-namespace overrides can re-enable sleep, so the loop must tick")
+		}
+	})
+}
+
 func TestIdleCheckInterval(t *testing.T) {
 	t.Run("zero interval with scale-to-zero enabled is a config error", func(t *testing.T) {
 		setMinimalEnv(t)

@@ -23,6 +23,7 @@ import (
 	"github.com/autonoma-ai/gatekeeper/internal/activity"
 	"github.com/autonoma-ai/gatekeeper/internal/auth"
 	"github.com/autonoma-ai/gatekeeper/internal/config"
+	"github.com/autonoma-ai/gatekeeper/internal/discovery"
 	"github.com/autonoma-ai/gatekeeper/internal/idle"
 	"github.com/autonoma-ai/gatekeeper/internal/leader"
 	"github.com/autonoma-ai/gatekeeper/internal/power"
@@ -62,6 +63,7 @@ func run() error {
 		"targetSelector", cfg.TargetSelector,
 		"routes", len(cfg.Routes),
 		"leaderElection", cfg.LeaderElection,
+		"namespaceSelector", cfg.NamespaceSelector,
 	)
 
 	restCfg, err := rest.InClusterConfig()
@@ -97,7 +99,9 @@ func run() error {
 		}
 	}
 	reg := registry.New(factory)
-	reg.Rebuild(cfg.Routes)
+	if !cfg.DiscoveryEnabled() {
+		reg.Rebuild(cfg.Routes, nil)
+	}
 
 	gate := auth.NewGate(cfg.AuthToken, cfg.AuthHeader, cfg.AuthCookie, cfg.LoginURL)
 	callbackHTML := auth.AuthCallbackPage(cfg.AuthCookie, cfg.CookieDomain)
@@ -106,22 +110,35 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// seed derives each namespace's awake/asleep state from the cluster and
+	// watcher is set below in discovery mode; seed and seedEnv only read it
+	// (nil in static mode).
+	var watcher *discovery.Watcher
+
+	// seedEnv derives one namespace's awake/asleep state from the cluster and
 	// resets its idle timer. Power state is best-effort: on failure we assume
 	// awake and reconcile on the first request / idle tick. The Touch matters
 	// on leadership acquisition: a standby's trackers aged without traffic,
 	// and must not sleep namespaces the previous leader was serving seconds
 	// ago - the cost is one extra idle timeout of awake time, same as any
 	// restart.
+	seedEnv := func(ctx context.Context, env *registry.Env) {
+		if err := env.Power.Init(ctx); err != nil {
+			log.Warn("could not determine initial power state; assuming awake",
+				"namespace", env.Namespace, "err", err)
+		}
+		env.Activity.Touch()
+	}
 	seed := func(parent context.Context) {
 		initCtx, cancelInit := context.WithTimeout(parent, initStateTimeout)
 		defer cancelInit()
+		// In discovery mode the registry is populated by the informer: an
+		// unsynced cache would seed nothing and leave later requests running
+		// against assumed-awake state.
+		if watcher != nil && !watcher.WaitForSync(initCtx) {
+			log.Warn("namespace cache not synced in time; seeding what is known so far")
+		}
 		for _, env := range reg.Envs() {
-			if err := env.Power.Init(initCtx); err != nil {
-				log.Warn("could not determine initial power state; assuming awake",
-					"namespace", env.Namespace, "err", err)
-			}
-			env.Activity.Touch()
+			seedEnv(initCtx, env)
 		}
 	}
 
@@ -131,14 +148,51 @@ func run() error {
 	// as a standby - state is re-derived from the cluster like any restart.
 	var leading func() bool
 	var leadershipLost <-chan struct{} // nil (blocks forever) without election
+	var elector *leader.Elector
 	if cfg.LeaderElection {
-		elector, err := leader.New(clientset, cfg.PodNamespace, cfg.LeaseName, cfg.PodName, seed, log)
+		var err error
+		if elector, err = leader.New(clientset, cfg.PodNamespace, cfg.LeaseName, cfg.PodName, seed, log); err != nil {
+			return err
+		}
+		leading = elector.IsLeader
+		leadershipLost = elector.Lost()
+	}
+
+	// Discovery: watch labeled namespaces and rebuild routes on every change.
+	// The informer runs on all replicas (standbys keep a warm cache); envs it
+	// adds are seeded here only while this replica is the active leader (or
+	// always, without election) - everything else is seeded on acquisition.
+	var ready func() bool
+	if cfg.DiscoveryEnabled() {
+		w, err := discovery.New(discovery.Options{
+			Client:                clientset,
+			Registry:              reg,
+			Selector:              cfg.NamespaceSelector,
+			RoutesAnnotation:      cfg.RoutesAnnotation,
+			IdleTimeoutAnnotation: cfg.IdleTimeoutAnnotation,
+			DefaultIdleTimeout:    cfg.IdleTimeout,
+			OnEnvAdded: func(env *registry.Env) {
+				if leading == nil || leading() {
+					seedCtx, cancel := context.WithTimeout(ctx, initStateTimeout)
+					defer cancel()
+					seedEnv(seedCtx, env)
+				}
+			},
+			EmitEvents: true,
+			Log:        log,
+		})
 		if err != nil {
 			return err
 		}
+		watcher = w
+		go watcher.Run(ctx)
+		ready = watcher.HasSynced
+	}
+
+	// The elector joins only after the watcher exists: its on-lead seeding
+	// waits for the namespace cache before deriving state.
+	if elector != nil {
 		go elector.Run(ctx)
-		leading = elector.IsLeader
-		leadershipLost = elector.Lost()
 		log.Info("leader election enabled; standing by until elected",
 			"lease", cfg.LeaseName, "identity", cfg.PodName)
 	} else {
@@ -147,12 +201,14 @@ func run() error {
 
 	// leading doubles as the serving gate: with leader election, proxied
 	// traffic fails closed on any replica that is not the seeded leader.
-	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.ReadyPath, nil, leading, cfg.WakeTimeout, log)
+	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.ReadyPath, ready, leading, cfg.WakeTimeout, log)
 
 	// With scale-to-zero disabled every Env's idle timeout is 0, so the loop
 	// could never sleep anything; don't start it (this also keeps the legacy
 	// IDLE_TIMEOUT=0 + IDLE_CHECK_INTERVAL=0 config working, as before).
-	if cfg.ScaleToZeroEnabled() {
+	// Discovery mode always runs it: per-namespace annotations can re-enable
+	// scale-to-zero even when the global default disables it.
+	if cfg.ScaleToZeroEnabled() || cfg.DiscoveryEnabled() {
 		go idle.New(reg, cfg.IdleCheckInterval, leading, log).Run(ctx)
 	} else {
 		log.Info("scale-to-zero disabled (idle timeout <= 0); idle loop not started")

@@ -30,8 +30,21 @@ type Config struct {
 
 	// Routes maps an incoming hostname to the in-cluster Service that serves
 	// it. Every entry's namespace is filled in (explicitly or from Namespace)
-	// by the time Load returns.
+	// by the time Load returns. Empty in discovery mode, where routes come
+	// from namespace annotations instead.
 	Routes map[string]routing.Upstream
+
+	// NamespaceSelector, when set, enables discovery mode: Gatekeeper watches
+	// Namespaces matching this label selector and reads each one's routes from
+	// RoutesAnnotation. Mutually exclusive with ROUTES_JSON.
+	NamespaceSelector string
+	// RoutesAnnotation holds a namespace's routes as the same JSON shape as
+	// ROUTES_JSON values, except entries must NOT name a namespace - a
+	// namespace's annotation can only route into that namespace.
+	RoutesAnnotation string
+	// IdleTimeoutAnnotation optionally overrides IdleTimeout per namespace
+	// (Go duration; <= 0 disables auto-sleep for that namespace).
+	IdleTimeoutAnnotation string
 
 	// Auth is OFF when AuthToken is empty: Gatekeeper then acts as a plain
 	// scale-to-zero reverse proxy. When set, every request must present the token
@@ -95,6 +108,10 @@ func (c *Config) AuthEnabled() bool { return c.AuthToken != "" }
 // requests still wake a namespace that is already asleep.
 func (c *Config) ScaleToZeroEnabled() bool { return c.IdleTimeout > 0 }
 
+// DiscoveryEnabled reports whether namespaces are discovered by label instead
+// of routed statically via ROUTES_JSON.
+func (c *Config) DiscoveryEnabled() bool { return c.NamespaceSelector != "" }
+
 // Load reads configuration from the environment and validates it. It returns an
 // error (rather than panicking) so the entrypoint can log and exit cleanly.
 func Load() (*Config, error) {
@@ -116,6 +133,9 @@ func Load() (*Config, error) {
 		LogLevel:               stringEnv("LOG_LEVEL", "info"),
 		PodName:                os.Getenv("POD_NAME"),
 		LeaseName:              stringEnv("LEASE_NAME", "gatekeeper"),
+		NamespaceSelector:      os.Getenv("NAMESPACE_SELECTOR"),
+		RoutesAnnotation:       stringEnv("ROUTES_ANNOTATION", "gatekeeper.dev/routes"),
+		IdleTimeoutAnnotation:  stringEnv("IDLE_TIMEOUT_ANNOTATION", "gatekeeper.dev/idle-timeout"),
 	}
 
 	var err error
@@ -136,7 +156,11 @@ func Load() (*Config, error) {
 		cfg.PodNamespace = cfg.Namespace
 	}
 
-	if cfg.Routes, err = parseRoutes(os.Getenv("ROUTES_JSON"), cfg.Namespace); err != nil {
+	if rawRoutes := os.Getenv("ROUTES_JSON"); cfg.DiscoveryEnabled() {
+		if strings.TrimSpace(rawRoutes) != "" {
+			return nil, errors.New("NAMESPACE_SELECTOR and ROUTES_JSON are mutually exclusive: routes come from namespace annotations in discovery mode")
+		}
+	} else if cfg.Routes, err = parseRoutes(rawRoutes, cfg.Namespace); err != nil {
 		return nil, err
 	}
 
@@ -152,10 +176,12 @@ func (c *Config) validate() error {
 	if c.PodNamespace == "" {
 		return errors.New("POD_NAMESPACE is required when NAMESPACE is not set (inject it via the downward API)")
 	}
-	if len(c.Routes) == 0 {
-		return errors.New("ROUTES_JSON must define at least one host -> upstream mapping")
+	if !c.DiscoveryEnabled() && len(c.Routes) == 0 {
+		return errors.New("ROUTES_JSON must define at least one host -> upstream mapping (or set NAMESPACE_SELECTOR for discovery)")
 	}
-	if c.ScaleToZeroEnabled() && c.IdleCheckInterval <= 0 {
+	// Discovery counts as scale-to-zero-capable regardless of the global
+	// IDLE_TIMEOUT: per-namespace annotations can (re-)enable it.
+	if (c.ScaleToZeroEnabled() || c.DiscoveryEnabled()) && c.IdleCheckInterval <= 0 {
 		return errors.New("IDLE_CHECK_INTERVAL must be > 0 when scale-to-zero is enabled (IDLE_TIMEOUT > 0)")
 	}
 	if c.ReadyPath == c.HealthPath {
