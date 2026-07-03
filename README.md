@@ -82,8 +82,9 @@ All configuration is via environment variables.
 
 | Env | Default | Purpose |
 |-----|---------|---------|
-| `NAMESPACE` | *(required)* | Namespace Gatekeeper manages. Inject via the downward API. |
-| `ROUTES_JSON` | *(required)* | `{"host":{"service":"svc","port":80}, ...}` host -> upstream map. |
+| `NAMESPACE` | *(see below)* | Default namespace for routes that don't name one. Inject via the downward API. |
+| `ROUTES_JSON` | *(required)* | `{"host":{"service":"svc","port":80}, ...}` host -> upstream map. An entry may add `"namespace":"other-ns"` to route into (and manage) another namespace; entries without one use `NAMESPACE`. Required: every entry ends up with a namespace one way or the other. |
+| `POD_NAMESPACE` | *(falls back to `NAMESPACE`)* | Namespace Gatekeeper itself runs in (downward API). `SELF_NAME` is only excluded from scaling here - a workload merely named the same elsewhere is managed normally. |
 | `PORT` | `8080` | Listen port. |
 | `HEALTH_PATH` | `/healthz` | Unauthenticated health/probe path. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. JSON logs to stdout. |

@@ -17,10 +17,19 @@ import (
 
 // Config is the fully-validated runtime configuration.
 type Config struct {
-	Port      int
-	Namespace string
+	Port int
 
-	// Routes maps an incoming hostname to the in-cluster Service that serves it.
+	// Namespace is the default namespace for ROUTES_JSON entries that don't
+	// name one. Optional when every entry carries its own namespace.
+	Namespace string
+	// PodNamespace is the namespace Gatekeeper itself runs in (inject via the
+	// downward API); SELF_NAME is only excluded from scaling there. Falls back
+	// to Namespace, which is where legacy single-namespace deployments run.
+	PodNamespace string
+
+	// Routes maps an incoming hostname to the in-cluster Service that serves
+	// it. Every entry's namespace is filled in (explicitly or from Namespace)
+	// by the time Load returns.
 	Routes map[string]routing.Upstream
 
 	// Auth is OFF when AuthToken is empty: Gatekeeper then acts as a plain
@@ -100,7 +109,11 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 
-	if cfg.Routes, err = parseRoutes(os.Getenv("ROUTES_JSON")); err != nil {
+	if cfg.PodNamespace = os.Getenv("POD_NAMESPACE"); cfg.PodNamespace == "" {
+		cfg.PodNamespace = cfg.Namespace
+	}
+
+	if cfg.Routes, err = parseRoutes(os.Getenv("ROUTES_JSON"), cfg.Namespace); err != nil {
 		return nil, err
 	}
 
@@ -111,17 +124,16 @@ func Load() (*Config, error) {
 }
 
 func (c *Config) validate() error {
-	if c.Namespace == "" {
-		return errors.New("NAMESPACE is required")
-	}
 	if len(c.Routes) == 0 {
 		return errors.New("ROUTES_JSON must define at least one host -> upstream mapping")
 	}
 	return nil
 }
 
-// parseRoutes parses the ROUTES_JSON map of hostname -> {service, port}.
-func parseRoutes(raw string) (map[string]routing.Upstream, error) {
+// parseRoutes parses the ROUTES_JSON map of hostname -> {namespace, service,
+// port}. Entries without a namespace get defaultNamespace (the NAMESPACE env),
+// so single-namespace configs stay as they always were.
+func parseRoutes(raw, defaultNamespace string) (map[string]routing.Upstream, error) {
 	if strings.TrimSpace(raw) == "" {
 		return nil, errors.New("ROUTES_JSON is required")
 	}
@@ -136,6 +148,12 @@ func parseRoutes(raw string) (map[string]routing.Upstream, error) {
 		}
 		if up.Port <= 0 || up.Port > 65535 {
 			return nil, fmt.Errorf("ROUTES_JSON entry %q has an invalid port %d", host, up.Port)
+		}
+		if up.Namespace == "" {
+			if defaultNamespace == "" {
+				return nil, fmt.Errorf("ROUTES_JSON entry %q has no namespace and NAMESPACE is not set", host)
+			}
+			up.Namespace = defaultNamespace
 		}
 		routes[strings.ToLower(host)] = up
 	}

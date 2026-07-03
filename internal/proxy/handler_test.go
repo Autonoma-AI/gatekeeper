@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/autonoma-ai/gatekeeper/internal/auth"
+	"github.com/autonoma-ai/gatekeeper/internal/registry"
 	"github.com/autonoma-ai/gatekeeper/internal/routing"
 )
 
@@ -21,29 +22,35 @@ const (
 	testHost   = "app.example.test"
 )
 
-type fakeWaker struct {
+type fakePower struct {
 	asleep      bool
 	ensureCalls int
 }
 
-func (f *fakeWaker) Asleep() bool                      { return f.asleep }
-func (f *fakeWaker) EnsureAwake(context.Context) error { f.ensureCalls++; return nil }
+func (f *fakePower) Init(context.Context) error        { return nil }
+func (f *fakePower) Asleep() bool                      { return f.asleep }
+func (f *fakePower) EnsureAwake(context.Context) error { f.ensureCalls++; return nil }
+func (f *fakePower) Sleep(context.Context) error       { return nil }
 
 type fakeReadiness struct{ calls int }
 
 func (f *fakeReadiness) WaitForReady(context.Context) error { f.calls++; return nil }
 
-type fakeToucher struct{ calls int }
+type fakeActivity struct{ calls int }
 
-func (f *fakeToucher) Touch() { f.calls++ }
+func (f *fakeActivity) Touch()                 { f.calls++ }
+func (f *fakeActivity) IdleFor() time.Duration { return 0 }
 
 func testLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func handlerWith(gate *auth.Gate, waker *fakeWaker, rd *fakeReadiness, tr *fakeToucher) *Handler {
-	table := routing.NewTable("test-ns", map[string]routing.Upstream{
-		testHost: {Service: "web", Port: 3000},
+func handlerWith(gate *auth.Gate, pw *fakePower, rd *fakeReadiness, act *fakeActivity) *Handler {
+	reg := registry.New(func(ns string) *registry.Env {
+		return &registry.Env{Namespace: ns, Power: pw, Readiness: rd, Activity: act}
 	})
-	return NewHandler(table, gate, waker, rd, tr, "<html>callback</html>", "/_gatekeeper/auth", "/healthz", 2*time.Second, testLogger())
+	reg.Rebuild(map[string]routing.Upstream{
+		testHost: {Namespace: "test-ns", Service: "web", Port: 3000},
+	})
+	return NewHandler(reg, gate, "<html>callback</html>", "/_gatekeeper/auth", "/healthz", 2*time.Second, testLogger())
 }
 
 func enabledGate(loginURL string) *auth.Gate {
@@ -52,7 +59,7 @@ func enabledGate(loginURL string) *auth.Gate {
 func disabledGate() *auth.Gate { return auth.NewGate("", testHeader, testCookie, "") }
 
 func TestHealthIsUnauthenticated(t *testing.T) {
-	h := handlerWith(enabledGate(""), &fakeWaker{}, &fakeReadiness{}, &fakeToucher{})
+	h := handlerWith(enabledGate(""), &fakePower{}, &fakeReadiness{}, &fakeActivity{})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/healthz", nil))
 	if rec.Code != http.StatusOK || strings.TrimSpace(rec.Body.String()) != "ok" {
@@ -61,7 +68,7 @@ func TestHealthIsUnauthenticated(t *testing.T) {
 }
 
 func TestAuthCallbackPathServesPageUnauthenticated(t *testing.T) {
-	h := handlerWith(enabledGate(""), &fakeWaker{}, &fakeReadiness{}, &fakeToucher{})
+	h := handlerWith(enabledGate(""), &fakePower{}, &fakeReadiness{}, &fakeActivity{})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/_gatekeeper/auth?token=x&next=/", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "callback") {
@@ -70,7 +77,7 @@ func TestAuthCallbackPathServesPageUnauthenticated(t *testing.T) {
 }
 
 func TestUnknownHostIs404(t *testing.T) {
-	h := handlerWith(disabledGate(), &fakeWaker{}, &fakeReadiness{}, &fakeToucher{})
+	h := handlerWith(disabledGate(), &fakePower{}, &fakeReadiness{}, &fakeActivity{})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://nope.example.test/", nil))
 	if rec.Code != http.StatusNotFound {
@@ -79,8 +86,8 @@ func TestUnknownHostIs404(t *testing.T) {
 }
 
 func TestAuthDisabledPassesThrough(t *testing.T) {
-	tr := &fakeToucher{}
-	h := handlerWith(disabledGate(), &fakeWaker{asleep: false}, &fakeReadiness{}, tr)
+	act := &fakeActivity{}
+	h := handlerWith(disabledGate(), &fakePower{asleep: false}, &fakeReadiness{}, act)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	rec := httptest.NewRecorder()
@@ -90,14 +97,14 @@ func TestAuthDisabledPassesThrough(t *testing.T) {
 	if rec.Code == http.StatusUnauthorized || rec.Code == http.StatusFound {
 		t.Fatalf("auth-disabled request should not be gated, got %d", rec.Code)
 	}
-	if tr.calls != 1 {
-		t.Fatalf("Touch calls = %d, want 1", tr.calls)
+	if act.calls != 1 {
+		t.Fatalf("Touch calls = %d, want 1", act.calls)
 	}
 }
 
 func TestUnauthorizedRedirectsWhenLoginURLSet(t *testing.T) {
-	tr := &fakeToucher{}
-	h := handlerWith(enabledGate("https://login.example.test"), &fakeWaker{}, &fakeReadiness{}, tr)
+	act := &fakeActivity{}
+	h := handlerWith(enabledGate("https://login.example.test"), &fakePower{}, &fakeReadiness{}, act)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/dashboard", nil))
 	if rec.Code != http.StatusFound {
@@ -106,13 +113,13 @@ func TestUnauthorizedRedirectsWhenLoginURLSet(t *testing.T) {
 	if loc := rec.Header().Get("Location"); !strings.HasPrefix(loc, "https://login.example.test?redirect=") {
 		t.Fatalf("Location = %q", loc)
 	}
-	if tr.calls != 0 {
-		t.Fatalf("unauthorized request must not record activity, got %d", tr.calls)
+	if act.calls != 0 {
+		t.Fatalf("unauthorized request must not record activity, got %d", act.calls)
 	}
 }
 
 func TestUnauthorizedIs401WhenNoLoginURL(t *testing.T) {
-	h := handlerWith(enabledGate(""), &fakeWaker{}, &fakeReadiness{}, &fakeToucher{})
+	h := handlerWith(enabledGate(""), &fakePower{}, &fakeReadiness{}, &fakeActivity{})
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/", nil))
 	if rec.Code != http.StatusUnauthorized {
@@ -121,30 +128,30 @@ func TestUnauthorizedIs401WhenNoLoginURL(t *testing.T) {
 }
 
 func TestAuthorizedAwakeTouchesAndDoesNotWake(t *testing.T) {
-	waker := &fakeWaker{asleep: false}
-	tr := &fakeToucher{}
-	h := handlerWith(enabledGate(""), waker, &fakeReadiness{}, tr)
+	pw := &fakePower{asleep: false}
+	act := &fakeActivity{}
+	h := handlerWith(enabledGate(""), pw, &fakeReadiness{}, act)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "http://"+testHost+"/", nil).WithContext(ctx)
 	req.Header.Set(testHeader, testToken)
 	h.ServeHTTP(httptest.NewRecorder(), req)
-	if tr.calls != 1 || waker.ensureCalls != 0 {
-		t.Fatalf("touch=%d ensure=%d, want 1/0", tr.calls, waker.ensureCalls)
+	if act.calls != 1 || pw.ensureCalls != 0 {
+		t.Fatalf("touch=%d ensure=%d, want 1/0", act.calls, pw.ensureCalls)
 	}
 }
 
 func TestAuthorizedAsleepWakesBeforeProxy(t *testing.T) {
-	waker := &fakeWaker{asleep: true}
+	pw := &fakePower{asleep: true}
 	rd := &fakeReadiness{}
-	tr := &fakeToucher{}
-	h := handlerWith(enabledGate(""), waker, rd, tr)
+	act := &fakeActivity{}
+	h := handlerWith(enabledGate(""), pw, rd, act)
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
 	req := httptest.NewRequest(http.MethodGet, "http://"+testHost+"/", nil).WithContext(ctx)
 	req.AddCookie(&http.Cookie{Name: testCookie, Value: testToken})
 	h.ServeHTTP(httptest.NewRecorder(), req)
-	if tr.calls != 1 || waker.ensureCalls != 1 || rd.calls != 1 {
-		t.Fatalf("touch=%d ensure=%d ready=%d, want 1/1/1", tr.calls, waker.ensureCalls, rd.calls)
+	if act.calls != 1 || pw.ensureCalls != 1 || rd.calls != 1 {
+		t.Fatalf("touch=%d ensure=%d ready=%d, want 1/1/1", act.calls, pw.ensureCalls, rd.calls)
 	}
 }

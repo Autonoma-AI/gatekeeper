@@ -1,6 +1,7 @@
-// Command gatekeeper is a per-namespace reverse proxy that authenticates preview
-// traffic, scales the namespace's workloads to zero when idle, and wakes them on
-// demand while holding the triggering request until the backend is ready.
+// Command gatekeeper is a reverse proxy for one or more namespaces that
+// authenticates preview traffic, scales each namespace's workloads to zero when
+// idle, and wakes them on demand while holding the triggering request until the
+// backend is ready.
 package main
 
 import (
@@ -25,7 +26,7 @@ import (
 	"github.com/autonoma-ai/gatekeeper/internal/idle"
 	"github.com/autonoma-ai/gatekeeper/internal/power"
 	"github.com/autonoma-ai/gatekeeper/internal/proxy"
-	"github.com/autonoma-ai/gatekeeper/internal/routing"
+	"github.com/autonoma-ai/gatekeeper/internal/registry"
 	"github.com/autonoma-ai/gatekeeper/internal/scaler"
 )
 
@@ -50,7 +51,8 @@ func run() error {
 	log := newLogger(cfg.LogLevel)
 	slog.SetDefault(log)
 	log.Info("starting gatekeeper",
-		"namespace", cfg.Namespace,
+		"defaultNamespace", cfg.Namespace,
+		"podNamespace", cfg.PodNamespace,
 		"port", cfg.Port,
 		"authEnabled", cfg.AuthEnabled(),
 		"scaleToZero", cfg.ScaleToZeroEnabled(),
@@ -64,34 +66,58 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("load in-cluster kube config: %w", err)
 	}
+	// The client default (QPS 5) throttles wake readiness polling as soon as a
+	// few namespaces wake concurrently; raise it well clear of that.
+	restCfg.QPS = 50
+	restCfg.Burst = 100
 	clientset, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		return fmt.Errorf("build kubernetes client: %w", err)
 	}
 
-	// Wire components.
-	table := routing.NewTable(cfg.Namespace, cfg.Routes)
+	// Wire components: one Env (scaler, power manager, activity tracker) per
+	// managed namespace, built by the registry from the routing table.
+	factory := func(ns string) *registry.Env {
+		nsLog := log.With("namespace", ns)
+		// Gatekeeper must never scale itself, but only its own namespace can
+		// contain it: elsewhere a workload merely sharing the name is managed.
+		self := ""
+		if ns == cfg.PodNamespace {
+			self = cfg.SelfName
+		}
+		sc := scaler.New(clientset, ns, cfg.TargetSelector, self, cfg.WakeReplicasAnnotation, cfg.DependsOnAnnotation, nsLog)
+		return &registry.Env{
+			Namespace:   ns,
+			Power:       power.New(sc, cfg.WakeTimeout, nsLog),
+			Readiness:   sc,
+			Activity:    activity.NewTracker(),
+			IdleTimeout: cfg.IdleTimeout,
+		}
+	}
+	reg := registry.New(factory)
+	reg.Rebuild(cfg.Routes)
+
 	gate := auth.NewGate(cfg.AuthToken, cfg.AuthHeader, cfg.AuthCookie, cfg.LoginURL)
 	callbackHTML := auth.AuthCallbackPage(cfg.AuthCookie, cfg.CookieDomain)
-	sc := scaler.New(clientset, cfg.Namespace, cfg.TargetSelector, cfg.SelfName, cfg.WakeReplicasAnnotation, cfg.DependsOnAnnotation, log)
-	pw := power.New(sc, cfg.WakeTimeout, log)
-	tracker := activity.NewTracker()
 
 	// Root context cancelled on SIGTERM/SIGINT.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// Seed awake/asleep state from the cluster. Best-effort: on failure we assume
-	// awake and reconcile on the first request / idle tick.
+	// Seed each namespace's awake/asleep state from the cluster. Best-effort: on
+	// failure we assume awake and reconcile on the first request / idle tick.
 	initCtx, cancelInit := context.WithTimeout(ctx, initStateTimeout)
-	if err := pw.Init(initCtx); err != nil {
-		log.Warn("could not determine initial power state; assuming awake", "err", err)
+	for _, env := range reg.Envs() {
+		if err := env.Power.Init(initCtx); err != nil {
+			log.Warn("could not determine initial power state; assuming awake",
+				"namespace", env.Namespace, "err", err)
+		}
 	}
 	cancelInit()
 
-	handler := proxy.NewHandler(table, gate, pw, sc, tracker, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.WakeTimeout, log)
+	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.WakeTimeout, log)
 
-	loop := idle.New(tracker, pw, cfg.IdleTimeout, cfg.IdleCheckInterval, log)
+	loop := idle.New(reg, cfg.IdleCheckInterval, log)
 	go loop.Run(ctx)
 
 	server := &http.Server{

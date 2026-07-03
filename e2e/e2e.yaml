@@ -1,5 +1,6 @@
 # End-to-end harness for a local cluster (OrbStack / kind / docker-desktop).
-# A sample "app" (traefik/whoami) plus a full Gatekeeper install in one namespace.
+# A sample "app" (traefik/whoami) in two namespaces plus one Gatekeeper install
+# (in the first namespace) managing both, so the multi-namespace path is covered.
 # Idle/wake timers are deliberately short so the sleep/wake cycle is observable.
 #
 # Apply with `e2e/run.sh` (builds the image + runs assertions), or by hand:
@@ -106,7 +107,10 @@ metadata:
   namespace: gatekeeper-e2e
 data:
   routes.json: |
-    { "whoami.example.test": { "service": "whoami", "port": 80 } }
+    {
+      "whoami.example.test": { "service": "whoami", "port": 80 },
+      "whoami-b.example.test": { "namespace": "gatekeeper-e2e-b", "service": "whoami", "port": 80 }
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -134,6 +138,10 @@ spec:
             - containerPort: 8080
           env:
             - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
@@ -185,3 +193,92 @@ spec:
   ports:
     - port: 80
       targetPort: 8080
+---
+# --- Second namespace: proves one Gatekeeper manages multiple namespaces. ---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gatekeeper-e2e-b
+---
+# Same sample app, reached via its own hostname (see the routes ConfigMap).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: whoami
+  namespace: gatekeeper-e2e-b
+  labels:
+    app: whoami
+    gatekeeper.dev/scale-to-zero: "true"
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: whoami
+  template:
+    metadata:
+      labels:
+        app: whoami
+        gatekeeper.dev/scale-to-zero: "true"
+    spec:
+      containers:
+        - name: whoami
+          image: traefik/whoami:latest
+          args: ["--port=80"]
+          ports:
+            - containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 1
+            periodSeconds: 2
+          resources:
+            requests:
+              cpu: 10m
+              memory: 16Mi
+            limits:
+              memory: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: whoami
+  namespace: gatekeeper-e2e-b
+  labels:
+    app: whoami
+spec:
+  type: ClusterIP
+  selector:
+    app: whoami
+  ports:
+    - port: 80
+      targetPort: 80
+---
+# Gatekeeper's ServiceAccount lives in gatekeeper-e2e; grant it the same
+# namespaced permissions here so it can manage this namespace too.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-e2e-b
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gatekeeper
+  namespace: gatekeeper-e2e-b
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gatekeeper
+subjects:
+  - kind: ServiceAccount
+    name: gatekeeper
+    namespace: gatekeeper-e2e

@@ -8,26 +8,33 @@ import (
 )
 
 // Upstream is a single app's in-cluster Service target. It is also the shape of
-// each value in the ROUTES_JSON config map (host -> upstream).
+// each value in the ROUTES_JSON config map (host -> upstream). Namespace is the
+// namespace the Service lives in; config fills it from NAMESPACE when omitted.
 type Upstream struct {
-	Service string `json:"service"`
-	Port    int    `json:"port"`
+	Namespace string `json:"namespace,omitempty"`
+	Service   string `json:"service"`
+	Port      int    `json:"port"`
 }
 
-// Table resolves request hostnames to upstreams and builds their in-cluster URLs.
+// URL returns the upstream's in-cluster Service URL, e.g.
+// http://web.preview-acme-pr-12.svc.cluster.local:3000
+func (u Upstream) URL() string {
+	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", u.Service, u.Namespace, u.Port)
+}
+
+// Table resolves request hostnames to upstreams.
 type Table struct {
-	namespace string
-	routes    map[string]Upstream
+	routes map[string]Upstream
 }
 
 // NewTable builds a routing table. Hostnames are stored lowercased so lookups
 // are case-insensitive regardless of how the Host header is cased.
-func NewTable(namespace string, routes map[string]Upstream) *Table {
+func NewTable(routes map[string]Upstream) *Table {
 	normalized := make(map[string]Upstream, len(routes))
 	for host, up := range routes {
 		normalized[strings.ToLower(host)] = up
 	}
-	return &Table{namespace: namespace, routes: normalized}
+	return &Table{routes: normalized}
 }
 
 // Resolve maps a request's Host header to its upstream. Any port suffix is
@@ -36,12 +43,6 @@ func NewTable(namespace string, routes map[string]Upstream) *Table {
 func (t *Table) Resolve(hostHeader string) (Upstream, bool) {
 	up, ok := t.routes[normalizeHost(hostHeader)]
 	return up, ok
-}
-
-// UpstreamURL returns the in-cluster Service URL for an upstream, e.g.
-// http://web.preview-acme-pr-12.svc.cluster.local:3000
-func (t *Table) UpstreamURL(up Upstream) string {
-	return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", up.Service, t.namespace, up.Port)
 }
 
 func normalizeHost(hostHeader string) string {
