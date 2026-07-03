@@ -113,6 +113,32 @@ Most "it deployed but nothing works" cases come from one of these drifting out o
   `SELF_NAME` must be Gatekeeper's own Deployment name so it never scales itself). If the
   selector matches nothing, idle scaling silently does nothing.
 
+### High availability (optional)
+
+With `LEADER_ELECTION=true`, run several replicas: they elect a leader through a
+Lease, and only the leader serves traffic, seeds power state, and runs the idle
+loop - the rest are warm standbys. Traffic is steered by a **pod label**
+(`gatekeeper.dev/role=leader`) that the leader sets on itself and the Service
+selects on; readiness stays uniform across replicas on purpose, since a
+Deployment with permanently-unready standbys could never complete a rollout.
+If the leader dies, a standby acquires the Lease (up to ~15s), re-derives all
+sleep/wake state from the cluster, and only then labels itself. Any replica
+that isn't the seeded leader answers proxied requests with 503 + `Retry-After`
+(probes and the auth callback are served everywhere), so a pod restarted with
+a stale leader label can never serve off wrong state. Don't add a
+PodDisruptionBudget: with one traffic-carrying pod it can only do nothing or
+block node drains - failover *is* the disruption tolerance.
+
+`deploy/cluster/` contains a complete cluster-mode install (3 replicas, leader
+Service, ClusterRole + leader Role).
+
+| Env | Default | Purpose |
+|-----|---------|---------|
+| `LEADER_ELECTION` | `false` | Enable active-passive HA. Requires `POD_NAME` and `POD_NAMESPACE` (downward API) and the `leases` + `pods get,patch` Role from `deploy/cluster/rbac.yaml`. |
+| `POD_NAME` | *(required with election)* | This pod's name: the election identity and the pod that gets the leader label. |
+| `LEASE_NAME` | `gatekeeper` | Lease object name, created in `POD_NAMESPACE`. |
+| `READY_PATH` | `/readyz` | Readiness probe path; must differ from `HEALTH_PATH` (liveness stays unconditional). |
+
 ### Authentication (optional)
 
 Authentication is **off** unless `AUTH_TOKEN` is set - Gatekeeper is then a plain

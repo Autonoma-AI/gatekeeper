@@ -156,9 +156,13 @@ The namespace-annotation design keeps cluster-wide reads to Namespaces only
   (clears staleness after a crash-restart), start informer (discovery mode),
   join election. Standbys keep a warm informer cache but do **not** seed power
   state or run the idle loop.
-- **OnStartedLeading**: label own pod `gatekeeper.dev/role=leader`; best-effort
-  strip the label from sibling pods; seed every Env's power state
-  (`power.Init`, as `main.go` does once today); enable the idle loop.
+- **OnStartedLeading**, strictly ordered: (1) seed every Env's power state and
+  reset its idle timer (a standby's timers aged without traffic and must not
+  sleep namespaces the previous leader was serving); (2) open the serving gate
+  (`IsLeader`); (3) strip stale leader labels and label own pod. Proxied
+  requests on any replica whose gate is closed - standbys, or a restarted pod
+  still wearing a stale leader label - fail closed with 503 + Retry-After;
+  probes and the auth callback stay served everywhere.
 - **Namespace added while leading** (discovery): create Env + seed it.
 - **OnStoppedLeading**: initiate the existing graceful shutdown and exit; the
   pod restarts as a standby. Guarantees at most one *intentionally* active

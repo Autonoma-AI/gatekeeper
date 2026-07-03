@@ -1,0 +1,73 @@
+# Cluster-mode RBAC. Gatekeeper runs once (in the "system" namespace) and
+# manages workloads across many namespaces, so the workload permissions move
+# from a per-namespace Role (deploy/role.yaml) to a ClusterRole. Leader
+# election and pod-label steering stay namespaced to Gatekeeper's own home.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gatekeeper
+  namespace: system
+---
+# Workload management across the managed namespaces: patch on the parent
+# objects sets spec.replicas and the wake annotation; workload status
+# (readyReplicas) and pod state are read on wake.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gatekeeper
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "statefulsets"]
+    verbs: ["get", "list", "watch", "patch"]
+  # pods: on wake, fail fast when a managed pod is wedged (bad image, crash
+  # loop) instead of holding the request until the wake timeout.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gatekeeper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: gatekeeper
+subjects:
+  - kind: ServiceAccount
+    name: gatekeeper
+    namespace: system
+---
+# Home-namespace permissions: the election Lease, and get/patch on pods so the
+# elected leader can label itself (the Service selects on that label).
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: gatekeeper-leader
+  namespace: system
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: gatekeeper-leader
+  namespace: system
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: gatekeeper-leader
+subjects:
+  - kind: ServiceAccount
+    name: gatekeeper
+    namespace: system

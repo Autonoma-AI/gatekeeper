@@ -36,20 +36,31 @@ type Handler struct {
 	callbackHTML string
 	callbackPath string
 	healthPath   string
+	readyPath    string
+	ready        func() bool
+	serving      func() bool
 	wakeTimeout  time.Duration
 	proxy        *httputil.ReverseProxy
 	log          *slog.Logger
 }
 
-// NewHandler wires the request pipeline. The reverse proxy uses a transport that
-// retries dial-refused errors for the duration of the request context, covering
-// the gap between a backend becoming scheduled and actually accepting connections.
+// NewHandler wires the request pipeline. ready gates the readiness endpoint
+// and serving gates all proxied traffic (nil = always); liveness (healthPath)
+// is unconditional. With leader election, serving is the leader check: a
+// standby - or a restarted pod still wearing a stale leader label - must fail
+// closed rather than serve off unseeded power state. The reverse proxy uses a
+// transport that retries dial-refused errors for the duration of the request
+// context, covering the gap between a backend becoming scheduled and actually
+// accepting connections.
 func NewHandler(
 	resolver Resolver,
 	gate *auth.Gate,
 	callbackHTML string,
 	callbackPath string,
 	healthPath string,
+	readyPath string,
+	ready func() bool,
+	serving func() bool,
 	wakeTimeout time.Duration,
 	log *slog.Logger,
 ) *Handler {
@@ -60,6 +71,9 @@ func NewHandler(
 		callbackHTML: callbackHTML,
 		callbackPath: callbackPath,
 		healthPath:   healthPath,
+		readyPath:    readyPath,
+		ready:        ready,
+		serving:      serving,
 		wakeTimeout:  wakeTimeout,
 		proxy:        newReverseProxy(transport, log),
 		log:          log,
@@ -67,11 +81,26 @@ func NewHandler(
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. Health check - unauthenticated (kubelet probes hit this).
+	// 1. Health check (liveness) - unauthenticated (kubelet probes hit this),
+	//    and unconditional: a live process is a live process.
 	if r.URL.Path == h.healthPath {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok")
+		return
+	}
+
+	// 1b. Readiness - unauthenticated, and gated (e.g. on discovery cache
+	//     sync) so a pod can be pulled from endpoints without being restarted.
+	if r.URL.Path == h.readyPath {
+		w.Header().Set("Content-Type", "text/plain")
+		if h.ready != nil && !h.ready() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "not ready")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ready")
 		return
 	}
 
@@ -84,7 +113,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Route by Host header to an upstream and its namespace.
+	// 3. Fail closed unless this replica may serve (with leader election: it
+	//    is the seeded leader). Probes and the auth callback stay available on
+	//    every replica; everything that would touch, wake, or proxy does not.
+	if h.serving != nil && !h.serving() {
+		w.Header().Set("Retry-After", "2")
+		http.Error(w, "Not the active replica, please retry shortly.", http.StatusServiceUnavailable)
+		return
+	}
+
+	// 4. Route by Host header to an upstream and its namespace.
 	env, upstream, ok := h.resolver.Resolve(r.Host)
 	if !ok {
 		h.log.Warn("no route for host", "host", r.Host)
@@ -92,7 +130,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 4. Auth gate (a no-op when authentication is disabled): redirect browsers to
+	// 5. Auth gate (a no-op when authentication is disabled): redirect browsers to
 	//    the login URL if one is configured, otherwise reject with 401.
 	if !h.gate.Authorized(r) {
 		if loc, redirect := h.gate.LoginRedirect(requestScheme(r), r.Host, r.URL.RequestURI()); redirect {
@@ -103,10 +141,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 5. Record activity so the idle loop keeps the namespace awake.
+	// 6. Record activity so the idle loop keeps the namespace awake.
 	env.Activity.Touch()
 
-	// 6. Wake the namespace and hold the request until every managed workload is
+	// 7. Wake the namespace and hold the request until every managed workload is
 	//    ready (not just this route's Service - so dependencies are up too).
 	if env.Power.Asleep() {
 		if err := h.wakeAndWait(r.Context(), env); err != nil {
@@ -117,7 +155,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 7. Reverse-proxy to the upstream Service.
+	// 8. Reverse-proxy to the upstream Service.
 	target, err := url.Parse(upstream.URL())
 	if err != nil {
 		h.log.Error("invalid upstream URL", "service", upstream.Service, "err", err)

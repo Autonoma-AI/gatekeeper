@@ -24,6 +24,7 @@ import (
 	"github.com/autonoma-ai/gatekeeper/internal/auth"
 	"github.com/autonoma-ai/gatekeeper/internal/config"
 	"github.com/autonoma-ai/gatekeeper/internal/idle"
+	"github.com/autonoma-ai/gatekeeper/internal/leader"
 	"github.com/autonoma-ai/gatekeeper/internal/power"
 	"github.com/autonoma-ai/gatekeeper/internal/proxy"
 	"github.com/autonoma-ai/gatekeeper/internal/registry"
@@ -60,6 +61,7 @@ func run() error {
 		"wakeTimeout", cfg.WakeTimeout.String(),
 		"targetSelector", cfg.TargetSelector,
 		"routes", len(cfg.Routes),
+		"leaderElection", cfg.LeaderElection,
 	)
 
 	restCfg, err := rest.InClusterConfig()
@@ -104,24 +106,54 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// Seed each namespace's awake/asleep state from the cluster. Best-effort: on
-	// failure we assume awake and reconcile on the first request / idle tick.
-	initCtx, cancelInit := context.WithTimeout(ctx, initStateTimeout)
-	for _, env := range reg.Envs() {
-		if err := env.Power.Init(initCtx); err != nil {
-			log.Warn("could not determine initial power state; assuming awake",
-				"namespace", env.Namespace, "err", err)
+	// seed derives each namespace's awake/asleep state from the cluster and
+	// resets its idle timer. Power state is best-effort: on failure we assume
+	// awake and reconcile on the first request / idle tick. The Touch matters
+	// on leadership acquisition: a standby's trackers aged without traffic,
+	// and must not sleep namespaces the previous leader was serving seconds
+	// ago - the cost is one extra idle timeout of awake time, same as any
+	// restart.
+	seed := func(parent context.Context) {
+		initCtx, cancelInit := context.WithTimeout(parent, initStateTimeout)
+		defer cancelInit()
+		for _, env := range reg.Envs() {
+			if err := env.Power.Init(initCtx); err != nil {
+				log.Warn("could not determine initial power state; assuming awake",
+					"namespace", env.Namespace, "err", err)
+			}
+			env.Activity.Touch()
 		}
 	}
-	cancelInit()
 
-	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.WakeTimeout, log)
+	// With leader election, state is seeded on becoming leader (not at start:
+	// a standby's snapshot would only go stale) and the idle loop only ticks
+	// on the leader. Losing leadership exits the process so the pod restarts
+	// as a standby - state is re-derived from the cluster like any restart.
+	var leading func() bool
+	var leadershipLost <-chan struct{} // nil (blocks forever) without election
+	if cfg.LeaderElection {
+		elector, err := leader.New(clientset, cfg.PodNamespace, cfg.LeaseName, cfg.PodName, seed, log)
+		if err != nil {
+			return err
+		}
+		go elector.Run(ctx)
+		leading = elector.IsLeader
+		leadershipLost = elector.Lost()
+		log.Info("leader election enabled; standing by until elected",
+			"lease", cfg.LeaseName, "identity", cfg.PodName)
+	} else {
+		seed(ctx)
+	}
+
+	// leading doubles as the serving gate: with leader election, proxied
+	// traffic fails closed on any replica that is not the seeded leader.
+	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.ReadyPath, nil, leading, cfg.WakeTimeout, log)
 
 	// With scale-to-zero disabled every Env's idle timeout is 0, so the loop
 	// could never sleep anything; don't start it (this also keeps the legacy
 	// IDLE_TIMEOUT=0 + IDLE_CHECK_INTERVAL=0 config working, as before).
 	if cfg.ScaleToZeroEnabled() {
-		go idle.New(reg, cfg.IdleCheckInterval, log).Run(ctx)
+		go idle.New(reg, cfg.IdleCheckInterval, leading, log).Run(ctx)
 	} else {
 		log.Info("scale-to-zero disabled (idle timeout <= 0); idle loop not started")
 	}
@@ -142,9 +174,13 @@ func run() error {
 		}
 	}()
 
+	var exitErr error
 	select {
 	case <-ctx.Done():
 		log.Info("shutdown signal received")
+	case <-leadershipLost:
+		log.Warn("leadership lost; shutting down to restart as a standby")
+		exitErr = errors.New("leadership lost")
 	case err := <-serverErr:
 		return fmt.Errorf("http server: %w", err)
 	}
@@ -155,7 +191,7 @@ func run() error {
 		return fmt.Errorf("graceful shutdown: %w", err)
 	}
 	log.Info("gatekeeper stopped")
-	return nil
+	return exitErr
 }
 
 func newLogger(level string) *slog.Logger {
