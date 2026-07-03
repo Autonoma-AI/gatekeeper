@@ -50,7 +50,7 @@ func handlerWith(gate *auth.Gate, pw *fakePower, rd *fakeReadiness, act *fakeAct
 	reg.Rebuild(map[string]routing.Upstream{
 		testHost: {Namespace: "test-ns", Service: "web", Port: 3000},
 	})
-	return NewHandler(reg, gate, "<html>callback</html>", "/_gatekeeper/auth", "/healthz", 2*time.Second, testLogger())
+	return NewHandler(reg, gate, "<html>callback</html>", "/_gatekeeper/auth", "/healthz", "/readyz", nil, 2*time.Second, testLogger())
 }
 
 func enabledGate(loginURL string) *auth.Gate {
@@ -73,6 +73,28 @@ func TestAuthCallbackPathServesPageUnauthenticated(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/_gatekeeper/auth?token=x&next=/", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "callback") {
 		t.Fatalf("callback = %d %q", rec.Code, rec.Body.String())
+	}
+}
+
+// Readiness is unauthenticated like health, but respects the gating func so a
+// pod can be pulled from endpoints (e.g. before discovery cache sync) without
+// failing liveness.
+func TestReadyPathFollowsGate(t *testing.T) {
+	ready := true
+	reg := registry.New(func(ns string) *registry.Env { return &registry.Env{Namespace: ns} })
+	h := NewHandler(reg, enabledGate(""), "", "/_gatekeeper/auth", "/healthz", "/readyz", func() bool { return ready }, time.Second, testLogger())
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ready readyz = %d, want 200", rec.Code)
+	}
+
+	ready = false
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("not-ready readyz = %d, want 503", rec.Code)
 	}
 }
 

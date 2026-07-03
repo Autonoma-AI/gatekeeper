@@ -68,7 +68,7 @@ func TestLoopTick(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			e, pw := env("ns", tt.timeout, tt.asleep, tt.idle)
-			loop := New(staticEnvs{e}, time.Second, testLogger())
+			loop := New(staticEnvs{e}, time.Second, nil, testLogger())
 
 			loop.tick(context.Background())
 
@@ -89,7 +89,7 @@ func TestTickSleepsOnlyIdleNamespaces(t *testing.T) {
 	idleEnv, idlePw := env("idle-ns", timeout, false, 31*time.Minute)
 	activeEnv, activePw := env("active-ns", timeout, false, 5*time.Minute)
 
-	loop := New(staticEnvs{idleEnv, activeEnv}, time.Second, testLogger())
+	loop := New(staticEnvs{idleEnv, activeEnv}, time.Second, nil, testLogger())
 	loop.tick(context.Background())
 
 	if idlePw.sleepCalls != 1 {
@@ -97,5 +97,24 @@ func TestTickSleepsOnlyIdleNamespaces(t *testing.T) {
 	}
 	if activePw.sleepCalls != 0 {
 		t.Fatalf("active-ns sleepCalls = %d, want 0", activePw.sleepCalls)
+	}
+}
+
+// A non-leader must never sleep namespaces: it receives no traffic, so every
+// namespace looks idle to it even while the leader is serving requests.
+func TestTickGatedOnLeadership(t *testing.T) {
+	e, pw := env("ns", 30*time.Minute, false, time.Hour)
+	leading := false
+	loop := New(staticEnvs{e}, time.Second, func() bool { return leading }, testLogger())
+
+	loop.tick(context.Background())
+	if pw.sleepCalls != 0 {
+		t.Fatalf("standby slept a namespace: sleepCalls = %d, want 0", pw.sleepCalls)
+	}
+
+	leading = true
+	loop.tick(context.Background())
+	if pw.sleepCalls != 1 {
+		t.Fatalf("leader sleepCalls = %d, want 1", pw.sleepCalls)
 	}
 }

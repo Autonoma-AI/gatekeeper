@@ -1,0 +1,18 @@
+# Traffic goes to the LEADER only: the selector includes the role label the
+# elected leader puts on its own pod. Standby pods are Ready but unselected;
+# on failover the new leader relabels itself and the endpoints follow.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gatekeeper
+  namespace: system
+  labels:
+    app: gatekeeper
+spec:
+  type: ClusterIP
+  selector:
+    app: gatekeeper
+    gatekeeper.dev/role: leader
+  ports:
+    - port: 80
+      targetPort: 8080

@@ -68,7 +68,23 @@ type Config struct {
 	DependsOnAnnotation string
 
 	HealthPath string
-	LogLevel   string
+	// ReadyPath serves readiness, distinct from HealthPath (liveness) so that
+	// readiness can be gated (e.g. on discovery cache sync) without ever
+	// affecting liveness. Readiness is deliberately NOT leadership-gated: a
+	// Deployment whose standby pods are permanently unready cannot complete a
+	// rollout, so traffic is steered to the leader by a pod label instead.
+	ReadyPath string
+	LogLevel  string
+
+	// LeaderElection enables active-passive HA: replicas elect a leader via a
+	// Lease named LeaseName in PodNamespace, and only the leader - labeled
+	// gatekeeper.dev/role=leader, which the Service selects on - receives
+	// traffic, seeds power state, and runs the idle loop. The others stand by.
+	LeaderElection bool
+	// PodName is this pod's name (inject via the downward API): the election
+	// identity and the pod the leader label is applied to.
+	PodName   string
+	LeaseName string
 }
 
 // AuthEnabled reports whether request authentication is active.
@@ -96,10 +112,16 @@ func Load() (*Config, error) {
 		WakeReplicasAnnotation: stringEnv("WAKE_REPLICAS_ANNOTATION", "gatekeeper.dev/wake-replicas"),
 		DependsOnAnnotation:    stringEnv("DEPENDS_ON_ANNOTATION", "gatekeeper.dev/depends-on"),
 		HealthPath:             stringEnv("HEALTH_PATH", "/healthz"),
+		ReadyPath:              stringEnv("READY_PATH", "/readyz"),
 		LogLevel:               stringEnv("LOG_LEVEL", "info"),
+		PodName:                os.Getenv("POD_NAME"),
+		LeaseName:              stringEnv("LEASE_NAME", "gatekeeper"),
 	}
 
 	var err error
+	if cfg.LeaderElection, err = boolEnv("LEADER_ELECTION", false); err != nil {
+		return nil, err
+	}
 	if cfg.IdleTimeout, err = durationEnv("IDLE_TIMEOUT", 30*time.Minute); err != nil {
 		return nil, err
 	}
@@ -135,6 +157,12 @@ func (c *Config) validate() error {
 	}
 	if c.ScaleToZeroEnabled() && c.IdleCheckInterval <= 0 {
 		return errors.New("IDLE_CHECK_INTERVAL must be > 0 when scale-to-zero is enabled (IDLE_TIMEOUT > 0)")
+	}
+	if c.ReadyPath == c.HealthPath {
+		return errors.New("READY_PATH and HEALTH_PATH must differ (liveness must stay unconditionally OK)")
+	}
+	if c.LeaderElection && c.PodName == "" {
+		return errors.New("POD_NAME is required when LEADER_ELECTION is enabled (inject it via the downward API)")
 	}
 	return nil
 }
@@ -186,6 +214,18 @@ func intEnv(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func boolEnv(key string, fallback bool) (bool, error) {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback, nil
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		return false, fmt.Errorf("invalid boolean for %s (want e.g. \"true\", \"false\"): %w", key, err)
+	}
+	return b, nil
 }
 
 func durationEnv(key string, fallback time.Duration) (time.Duration, error) {

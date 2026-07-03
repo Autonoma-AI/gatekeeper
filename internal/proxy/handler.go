@@ -36,20 +36,26 @@ type Handler struct {
 	callbackHTML string
 	callbackPath string
 	healthPath   string
+	readyPath    string
+	ready        func() bool
 	wakeTimeout  time.Duration
 	proxy        *httputil.ReverseProxy
 	log          *slog.Logger
 }
 
-// NewHandler wires the request pipeline. The reverse proxy uses a transport that
-// retries dial-refused errors for the duration of the request context, covering
-// the gap between a backend becoming scheduled and actually accepting connections.
+// NewHandler wires the request pipeline. ready gates the readiness endpoint
+// (nil = always ready); liveness (healthPath) is unconditional. The reverse
+// proxy uses a transport that retries dial-refused errors for the duration of
+// the request context, covering the gap between a backend becoming scheduled
+// and actually accepting connections.
 func NewHandler(
 	resolver Resolver,
 	gate *auth.Gate,
 	callbackHTML string,
 	callbackPath string,
 	healthPath string,
+	readyPath string,
+	ready func() bool,
 	wakeTimeout time.Duration,
 	log *slog.Logger,
 ) *Handler {
@@ -60,6 +66,8 @@ func NewHandler(
 		callbackHTML: callbackHTML,
 		callbackPath: callbackPath,
 		healthPath:   healthPath,
+		readyPath:    readyPath,
+		ready:        ready,
 		wakeTimeout:  wakeTimeout,
 		proxy:        newReverseProxy(transport, log),
 		log:          log,
@@ -67,11 +75,26 @@ func NewHandler(
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 1. Health check - unauthenticated (kubelet probes hit this).
+	// 1. Health check (liveness) - unauthenticated (kubelet probes hit this),
+	//    and unconditional: a live process is a live process.
 	if r.URL.Path == h.healthPath {
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		_, _ = io.WriteString(w, "ok")
+		return
+	}
+
+	// 1b. Readiness - unauthenticated, and gated (e.g. on discovery cache
+	//     sync) so a pod can be pulled from endpoints without being restarted.
+	if r.URL.Path == h.readyPath {
+		w.Header().Set("Content-Type", "text/plain")
+		if h.ready != nil && !h.ready() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "not ready")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "ready")
 		return
 	}
 

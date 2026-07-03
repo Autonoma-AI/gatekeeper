@@ -19,12 +19,15 @@ type EnvLister interface {
 type Loop struct {
 	envs     EnvLister
 	interval time.Duration
+	leading  func() bool
 	log      *slog.Logger
 }
 
-// New builds an idle Loop.
-func New(envs EnvLister, interval time.Duration, log *slog.Logger) *Loop {
-	return &Loop{envs: envs, interval: interval, log: log}
+// New builds an idle Loop. leading gates each tick (nil = always): with leader
+// election, only the leader may sleep namespaces - a standby receives no
+// traffic by construction, so its idle timers would fire spuriously.
+func New(envs EnvLister, interval time.Duration, leading func() bool, log *slog.Logger) *Loop {
+	return &Loop{envs: envs, interval: interval, leading: leading, log: log}
 }
 
 // Run ticks until ctx is cancelled. On each tick, every managed namespace that
@@ -47,6 +50,9 @@ func (l *Loop) Run(ctx context.Context) {
 }
 
 func (l *Loop) tick(ctx context.Context) {
+	if l.leading != nil && !l.leading() {
+		return
+	}
 	for _, env := range l.envs.Envs() {
 		if env.IdleTimeout <= 0 || env.Power.Asleep() {
 			continue

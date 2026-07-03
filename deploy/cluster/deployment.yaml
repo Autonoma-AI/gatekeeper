@@ -1,0 +1,104 @@
+# Cluster-mode Gatekeeper: 3 replicas, active-passive. All replicas are Ready
+# (a Deployment with permanently-unready standbys could never roll), but only
+# the elected leader carries the gatekeeper.dev/role=leader pod label, and the
+# Service (service.yaml) selects on it - so exactly one pod receives traffic.
+#
+# Deliberately NO PodDisruptionBudget: with one traffic-carrying pod a PDB
+# either does nothing or deadlocks node drains. Disruption tolerance is the
+# failover itself (a standby takes over within ~15-20s of the leader dying).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gatekeeper
+  namespace: system
+  labels:
+    app: gatekeeper
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: gatekeeper
+  template:
+    metadata:
+      labels:
+        app: gatekeeper
+    spec:
+      serviceAccountName: gatekeeper
+      # Spread replicas across zones so a zone outage leaves a standby alive.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: gatekeeper
+      containers:
+        - name: gatekeeper
+          image: public.ecr.aws/autonoma/gatekeeper:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+          env:
+            # --- identity (downward API; both required in cluster mode) ---
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: LEADER_ELECTION
+              value: "true"
+            # --- routing: every entry names its namespace ---
+            - name: ROUTES_JSON
+              valueFrom:
+                configMapKeyRef:
+                  name: gatekeeper-routes
+                  key: routes.json
+            # --- scale-to-zero (same knobs as single-namespace mode) ---
+            - name: TARGET_SELECTOR
+              value: "gatekeeper.dev/scale-to-zero=true"
+            - name: IDLE_TIMEOUT
+              value: "30m"
+            # HEALTH_PATH / READY_PATH MUST equal the probe paths below.
+            - name: HEALTH_PATH
+              value: "/healthz"
+            - name: READY_PATH
+              value: "/readyz"
+            # --- auth (optional; leaving AUTH_TOKEN unset disables auth) ---
+            # - name: AUTH_TOKEN
+            #   value: "change-me"
+          # Liveness is unconditional; readiness is gated (e.g. discovery cache
+          # sync) but NOT leadership-gated - standbys are Ready on purpose.
+          livenessProbe:
+            httpGet:
+              path: /healthz # MUST equal HEALTH_PATH above
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /readyz # MUST equal READY_PATH above
+              port: 8080
+            initialDelaySeconds: 1
+            periodSeconds: 3
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+---
+# Example routes for cluster mode: every entry names its target namespace.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gatekeeper-routes
+  namespace: system
+data:
+  routes.json: |
+    {
+      "app-pr12.example.com": { "namespace": "preview-pr-12", "service": "web", "port": 3000 },
+      "api-pr12.example.com": { "namespace": "preview-pr-12", "service": "api", "port": 8080 }
+    }

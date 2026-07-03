@@ -193,6 +193,55 @@ func TestLoadInvalidDuration(t *testing.T) {
 	}
 }
 
+func TestLeaderElectionConfig(t *testing.T) {
+	t.Run("disabled by default", func(t *testing.T) {
+		setMinimalEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.LeaderElection {
+			t.Error("LeaderElection should default to false")
+		}
+		if cfg.LeaseName != "gatekeeper" || cfg.ReadyPath != "/readyz" {
+			t.Errorf("lease/ready defaults = %q / %q", cfg.LeaseName, cfg.ReadyPath)
+		}
+	})
+	t.Run("enabled requires POD_NAME", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("LEADER_ELECTION", "true")
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error: LEADER_ELECTION without POD_NAME")
+		}
+	})
+	t.Run("enabled with POD_NAME loads", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("LEADER_ELECTION", "true")
+		t.Setenv("POD_NAME", "gatekeeper-abc12")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if !cfg.LeaderElection || cfg.PodName != "gatekeeper-abc12" {
+			t.Errorf("LeaderElection=%v PodName=%q", cfg.LeaderElection, cfg.PodName)
+		}
+	})
+	t.Run("invalid boolean errors", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("LEADER_ELECTION", "yes-please")
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error for invalid LEADER_ELECTION")
+		}
+	})
+	t.Run("READY_PATH must differ from HEALTH_PATH", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("READY_PATH", "/healthz")
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error: READY_PATH colliding with HEALTH_PATH")
+		}
+	})
+}
+
 func TestIdleCheckInterval(t *testing.T) {
 	t.Run("zero interval with scale-to-zero enabled is a config error", func(t *testing.T) {
 		setMinimalEnv(t)
