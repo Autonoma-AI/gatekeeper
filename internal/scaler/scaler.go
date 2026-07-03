@@ -42,10 +42,11 @@ type Scaler struct {
 }
 
 // New builds a Scaler. targetSelector is the label selector for managed workloads
-// (empty = all); selfName is the workload name to never scale (Gatekeeper itself);
-// wakeAnnotation is the annotation key used to remember a workload's replica count;
-// dependsOnAnnotation is the annotation key listing a workload's dependencies (used
-// to order wake-up).
+// (empty = all); selfName is the workload name to never scale - Gatekeeper itself,
+// so callers pass it only for Gatekeeper's own namespace and "" (exclude nothing)
+// elsewhere; wakeAnnotation is the annotation key used to remember a workload's
+// replica count; dependsOnAnnotation is the annotation key listing a workload's
+// dependencies (used to order wake-up).
 func New(client kubernetes.Interface, namespace, targetSelector, selfName, wakeAnnotation, dependsOnAnnotation string, log *slog.Logger) *Scaler {
 	return &Scaler{
 		client:         client,

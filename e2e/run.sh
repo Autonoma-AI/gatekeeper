@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # End-to-end test for Gatekeeper against a LOCAL Kubernetes cluster.
-# Builds the image, deploys a sample app + Gatekeeper, then asserts the full
-# auth -> sleep -> wake cycle through a port-forward.
+# Builds the image, deploys a sample app in two namespaces + one Gatekeeper
+# managing both, then asserts the full auth -> sleep -> wake cycle through a
+# port-forward, including that the namespaces sleep and wake independently.
 #
 #   ./e2e/run.sh                 # uses context "orbstack"
 #   KUBE_CONTEXT=kind-foo ./e2e/run.sh
@@ -11,8 +12,10 @@ set -euo pipefail
 
 CONTEXT="${KUBE_CONTEXT:-orbstack}"
 NS="gatekeeper-e2e"
+NSB="gatekeeper-e2e-b"
 TOKEN="e2e-secret-token"
 HOSTH="whoami.example.test"
+HOSTB="whoami-b.example.test"
 LOGIN="http://login.example.test"
 LOCAL_PORT="${LOCAL_PORT:-18080}"
 IMAGE="gatekeeper:dev"
@@ -33,12 +36,13 @@ fail() { echo "  ✗ $1"; FAILED=1; }
 echo "==> Building $IMAGE"
 docker build -q -t "$IMAGE" "$ROOT" >/dev/null
 
-echo "==> Applying manifests (context=$CONTEXT ns=$NS)"
+echo "==> Applying manifests (context=$CONTEXT ns=$NS,$NSB)"
 k apply -f "$ROOT/e2e/e2e.yaml" >/dev/null
 
 echo "==> Waiting for rollouts"
 k -n "$NS" rollout status deploy/gatekeeper --timeout=120s
 k -n "$NS" rollout status deploy/whoami --timeout=120s
+k -n "$NSB" rollout status deploy/whoami --timeout=120s
 
 echo "==> Port-forwarding svc/gatekeeper -> localhost:$LOCAL_PORT"
 k -n "$NS" port-forward svc/gatekeeper "${LOCAL_PORT}:80" >/tmp/gk-pf.log 2>&1 &
@@ -82,14 +86,30 @@ else
   fail "authenticated proxy"
 fi
 
-echo "==> 5. scales the app to zero after the idle timeout (~20s)"
+echo "==> 5. request for the second namespace's host is proxied cross-namespace"
+body=$(curl -s -H "Host: $HOSTB" -H "x-gatekeeper-token: $TOKEN" "$base/")
+if echo "$body" | grep -qi "Hostname:" && echo "$body" | grep -q "X-Forwarded-Proto: http"; then
+  pass "proxied to whoami in $NSB"
+else
+  echo "$body"
+  fail "cross-namespace proxy"
+fi
+
+echo "==> 6. scales both namespaces to zero after the idle timeout (~20s)"
 sleep 32
 rep=$(k -n "$NS" get deploy whoami -o jsonpath='{.spec.replicas}')
 ann=$(k -n "$NS" get deploy whoami -o jsonpath='{.metadata.annotations.gatekeeper\.dev/wake-replicas}')
 if [ "$rep" = "0" ] && [ "$ann" = "1" ]; then
-  pass "whoami scaled to 0 (saved wake-replicas=$ann)"
+  pass "$NS/whoami scaled to 0 (saved wake-replicas=$ann)"
 else
-  fail "expected whoami replicas=0 wake-replicas=1 (got replicas=$rep ann=$ann)"
+  fail "expected $NS/whoami replicas=0 wake-replicas=1 (got replicas=$rep ann=$ann)"
+fi
+repb=$(k -n "$NSB" get deploy whoami -o jsonpath='{.spec.replicas}')
+annb=$(k -n "$NSB" get deploy whoami -o jsonpath='{.metadata.annotations.gatekeeper\.dev/wake-replicas}')
+if [ "$repb" = "0" ] && [ "$annb" = "1" ]; then
+  pass "$NSB/whoami scaled to 0 (saved wake-replicas=$annb)"
+else
+  fail "expected $NSB/whoami replicas=0 wake-replicas=1 (got replicas=$repb ann=$annb)"
 fi
 if [ "$(k -n "$NS" get deploy gatekeeper -o jsonpath='{.spec.replicas}')" = "1" ]; then
   pass "gatekeeper did NOT scale itself down"
@@ -97,13 +117,28 @@ else
   fail "gatekeeper scaled itself down"
 fi
 
-echo "==> 6. next request wakes the app and holds until ready"
+echo "==> 7. next request wakes the first namespace only (isolation)"
 code=$(curl -s -m 60 -o /tmp/gk.out -w '%{http_code}' -H "Host: $HOSTH" -H "x-gatekeeper-token: $TOKEN" "$base/")
 rep=$(k -n "$NS" get deploy whoami -o jsonpath='{.spec.replicas}')
 if [ "$code" = "200" ] && [ "$rep" = "1" ] && grep -qi Hostname /tmp/gk.out; then
-  pass "request woke whoami (replicas=$rep) and returned 200"
+  pass "request woke $NS/whoami (replicas=$rep) and returned 200"
 else
   fail "wake-on-request (http=$code replicas=$rep)"
+fi
+repb=$(k -n "$NSB" get deploy whoami -o jsonpath='{.spec.replicas}')
+if [ "$repb" = "0" ]; then
+  pass "$NSB/whoami stayed asleep (replicas=$repb)"
+else
+  fail "waking $NS must not wake $NSB (got replicas=$repb)"
+fi
+
+echo "==> 8. the second namespace wakes independently on its own host"
+code=$(curl -s -m 60 -o /tmp/gk.out -w '%{http_code}' -H "Host: $HOSTB" -H "x-gatekeeper-token: $TOKEN" "$base/")
+repb=$(k -n "$NSB" get deploy whoami -o jsonpath='{.spec.replicas}')
+if [ "$code" = "200" ] && [ "$repb" = "1" ] && grep -qi Hostname /tmp/gk.out; then
+  pass "request woke $NSB/whoami (replicas=$repb) and returned 200"
+else
+  fail "wake-on-request for $NSB (http=$code replicas=$repb)"
 fi
 
 echo
@@ -116,6 +151,6 @@ if [ "$FAILED" = "0" ]; then
 else
   echo "SOME E2E CHECKS FAILED ❌"
 fi
-echo "Namespace '$NS' left running for inspection."
-echo "Tear down with: kubectl --context $CONTEXT delete ns $NS"
+echo "Namespaces '$NS' and '$NSB' left running for inspection."
+echo "Tear down with: kubectl --context $CONTEXT delete ns $NS $NSB"
 exit $FAILED

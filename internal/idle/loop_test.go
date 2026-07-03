@@ -6,27 +6,46 @@ import (
 	"log/slog"
 	"testing"
 	"time"
+
+	"github.com/autonoma-ai/gatekeeper/internal/registry"
 )
 
-type fakeSleeper struct {
+type fakePower struct {
 	asleep     bool
 	sleepCalls int
 }
 
-func (f *fakeSleeper) Asleep() bool { return f.asleep }
+func (f *fakePower) Init(context.Context) error        { return nil }
+func (f *fakePower) Asleep() bool                      { return f.asleep }
+func (f *fakePower) EnsureAwake(context.Context) error { return nil }
 
-func (f *fakeSleeper) Sleep(context.Context) error {
+func (f *fakePower) Sleep(context.Context) error {
 	f.sleepCalls++
 	f.asleep = true
 	return nil
 }
 
-type fakeReporter struct{ idle time.Duration }
+type fakeActivity struct{ idle time.Duration }
 
-func (f *fakeReporter) IdleFor() time.Duration { return f.idle }
+func (f *fakeActivity) Touch()                 {}
+func (f *fakeActivity) IdleFor() time.Duration { return f.idle }
+
+type staticEnvs []*registry.Env
+
+func (s staticEnvs) Envs() []*registry.Env { return s }
 
 func testLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+func env(ns string, timeout time.Duration, asleep bool, idle time.Duration) (*registry.Env, *fakePower) {
+	pw := &fakePower{asleep: asleep}
+	return &registry.Env{
+		Namespace:   ns,
+		Power:       pw,
+		Activity:    &fakeActivity{idle: idle},
+		IdleTimeout: timeout,
+	}, pw
 }
 
 func TestLoopTick(t *testing.T) {
@@ -34,47 +53,49 @@ func TestLoopTick(t *testing.T) {
 
 	tests := []struct {
 		name       string
+		timeout    time.Duration
 		asleep     bool
 		idle       time.Duration
 		wantSleeps int
 		wantAsleep bool
 	}{
-		{"awake and idle past threshold scales down", false, 31 * time.Minute, 1, true},
-		{"awake but still active stays up", false, 5 * time.Minute, 0, false},
-		{"already asleep is a no-op", true, 99 * time.Minute, 0, true},
+		{"awake and idle past threshold scales down", timeout, false, 31 * time.Minute, 1, true},
+		{"awake but still active stays up", timeout, false, 5 * time.Minute, 0, false},
+		{"already asleep is a no-op", timeout, true, 99 * time.Minute, 0, true},
+		{"zero idle timeout never sleeps", 0, false, 99 * time.Hour, 0, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sleeper := &fakeSleeper{asleep: tt.asleep}
-			reporter := &fakeReporter{idle: tt.idle}
-			loop := New(reporter, sleeper, timeout, time.Second, testLogger())
+			e, pw := env("ns", tt.timeout, tt.asleep, tt.idle)
+			loop := New(staticEnvs{e}, time.Second, testLogger())
 
 			loop.tick(context.Background())
 
-			if sleeper.sleepCalls != tt.wantSleeps {
-				t.Fatalf("sleepCalls = %d, want %d", sleeper.sleepCalls, tt.wantSleeps)
+			if pw.sleepCalls != tt.wantSleeps {
+				t.Fatalf("sleepCalls = %d, want %d", pw.sleepCalls, tt.wantSleeps)
 			}
-			if sleeper.asleep != tt.wantAsleep {
-				t.Fatalf("asleep = %v, want %v", sleeper.asleep, tt.wantAsleep)
+			if pw.asleep != tt.wantAsleep {
+				t.Fatalf("asleep = %v, want %v", pw.asleep, tt.wantAsleep)
 			}
 		})
 	}
 }
 
-// A zero idle timeout disables scale-to-zero: Run returns at once and never sleeps,
-// even with the namespace awake and idle far past any threshold.
-func TestRunDisabledWhenIdleTimeoutZero(t *testing.T) {
-	sleeper := &fakeSleeper{asleep: false}
-	loop := New(&fakeReporter{idle: time.Hour}, sleeper, 0, time.Millisecond, testLogger())
+// Each namespace idles independently: a tick sleeps only the namespaces past
+// their own threshold, never the ones still receiving traffic.
+func TestTickSleepsOnlyIdleNamespaces(t *testing.T) {
+	const timeout = 30 * time.Minute
+	idleEnv, idlePw := env("idle-ns", timeout, false, 31*time.Minute)
+	activeEnv, activePw := env("active-ns", timeout, false, 5*time.Minute)
 
-	// Bounded ctx so a regression (loop not actually disabled) fails fast instead
-	// of hanging: a disabled loop returns immediately, well within this deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
-	loop.Run(ctx)
+	loop := New(staticEnvs{idleEnv, activeEnv}, time.Second, testLogger())
+	loop.tick(context.Background())
 
-	if sleeper.sleepCalls != 0 {
-		t.Fatalf("sleepCalls = %d, want 0 (scale-to-zero disabled)", sleeper.sleepCalls)
+	if idlePw.sleepCalls != 1 {
+		t.Fatalf("idle-ns sleepCalls = %d, want 1", idlePw.sleepCalls)
+	}
+	if activePw.sleepCalls != 0 {
+		t.Fatalf("active-ns sleepCalls = %d, want 0", activePw.sleepCalls)
 	}
 }

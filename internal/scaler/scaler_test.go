@@ -348,3 +348,17 @@ func TestWakeAllOrdersByDependency(t *testing.T) {
 		}
 	})
 }
+
+// Outside Gatekeeper's own namespace the factory passes an empty selfName:
+// nothing is excluded, even a workload that happens to be named "gatekeeper".
+func TestEmptySelfNameExcludesNothing(t *testing.T) {
+	client := fake.NewSimpleClientset(deploy(selfName, 2, nil))
+	s := New(client, testNS, "", "", wakeAnn, depAnn, testLogger())
+
+	if err := s.SleepAll(context.Background()); err != nil {
+		t.Fatalf("SleepAll: %v", err)
+	}
+	if got := *getDeploy(t, client, selfName).Spec.Replicas; got != 0 {
+		t.Fatalf("replicas = %d, want 0 (no self-exclusion with empty selfName)", got)
+	}
+}

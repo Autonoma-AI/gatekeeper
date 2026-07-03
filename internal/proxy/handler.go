@@ -1,6 +1,6 @@
 // Package proxy is Gatekeeper's HTTP surface: it (optionally) authenticates each
-// request, records activity, wakes the namespace and holds the request when
-// asleep, then reverse-proxies to the in-cluster upstream Service. Websocket
+// request, records activity, wakes the routed namespace and holds the request
+// when asleep, then reverse-proxies to the in-cluster upstream Service. Websocket
 // upgrades are handled transparently by httputil.ReverseProxy after the gate runs.
 package proxy
 
@@ -18,33 +18,21 @@ import (
 	"time"
 
 	"github.com/autonoma-ai/gatekeeper/internal/auth"
+	"github.com/autonoma-ai/gatekeeper/internal/registry"
 	"github.com/autonoma-ai/gatekeeper/internal/routing"
 )
 
-// Waker is the power-management surface the handler needs.
-type Waker interface {
-	Asleep() bool
-	EnsureAwake(ctx context.Context) error
+// Resolver maps a request's Host header to the upstream that serves it and the
+// managed namespace (Env) the upstream belongs to (implemented by
+// *registry.Registry).
+type Resolver interface {
+	Resolve(host string) (*registry.Env, routing.Upstream, bool)
 }
 
-// ReadinessWaiter blocks until every managed workload in the namespace is ready,
-// returns early if a managed pod is wedged and won't become ready, or ctx expires.
-type ReadinessWaiter interface {
-	WaitForReady(ctx context.Context) error
-}
-
-// Toucher records request activity.
-type Toucher interface {
-	Touch()
-}
-
-// Handler implements http.Handler for all traffic in one namespace.
+// Handler implements http.Handler for all traffic across the managed namespaces.
 type Handler struct {
-	routes       *routing.Table
+	resolver     Resolver
 	gate         *auth.Gate
-	power        Waker
-	readiness    ReadinessWaiter
-	tracker      Toucher
 	callbackHTML string
 	callbackPath string
 	healthPath   string
@@ -57,11 +45,8 @@ type Handler struct {
 // retries dial-refused errors for the duration of the request context, covering
 // the gap between a backend becoming scheduled and actually accepting connections.
 func NewHandler(
-	routes *routing.Table,
+	resolver Resolver,
 	gate *auth.Gate,
-	pw Waker,
-	readiness ReadinessWaiter,
-	tracker Toucher,
 	callbackHTML string,
 	callbackPath string,
 	healthPath string,
@@ -70,11 +55,8 @@ func NewHandler(
 ) *Handler {
 	transport := &retryTransport{base: http.DefaultTransport}
 	return &Handler{
-		routes:       routes,
+		resolver:     resolver,
 		gate:         gate,
-		power:        pw,
-		readiness:    readiness,
-		tracker:      tracker,
 		callbackHTML: callbackHTML,
 		callbackPath: callbackPath,
 		healthPath:   healthPath,
@@ -102,8 +84,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 3. Route by Host header.
-	upstream, ok := h.routes.Resolve(r.Host)
+	// 3. Route by Host header to an upstream and its namespace.
+	env, upstream, ok := h.resolver.Resolve(r.Host)
 	if !ok {
 		h.log.Warn("no route for host", "host", r.Host)
 		http.Error(w, "Unknown host", http.StatusNotFound)
@@ -122,13 +104,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 5. Record activity so the idle loop keeps the namespace awake.
-	h.tracker.Touch()
+	env.Activity.Touch()
 
 	// 6. Wake the namespace and hold the request until every managed workload is
 	//    ready (not just this route's Service - so dependencies are up too).
-	if h.power.Asleep() {
-		if err := h.wakeAndWait(r.Context()); err != nil {
-			h.log.Error("wake failed", "host", r.Host, "service", upstream.Service, "err", err)
+	if env.Power.Asleep() {
+		if err := h.wakeAndWait(r.Context(), env); err != nil {
+			h.log.Error("wake failed", "namespace", env.Namespace, "host", r.Host, "service", upstream.Service, "err", err)
 			w.Header().Set("Retry-After", "5")
 			http.Error(w, "Service is waking up, please retry shortly.", http.StatusServiceUnavailable)
 			return
@@ -136,7 +118,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 7. Reverse-proxy to the upstream Service.
-	target, err := url.Parse(h.routes.UpstreamURL(upstream))
+	target, err := url.Parse(upstream.URL())
 	if err != nil {
 		h.log.Error("invalid upstream URL", "service", upstream.Service, "err", err)
 		http.Error(w, "Bad gateway", http.StatusBadGateway)
@@ -145,13 +127,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.proxy.ServeHTTP(w, r.WithContext(withTarget(r.Context(), target)))
 }
 
-func (h *Handler) wakeAndWait(ctx context.Context) error {
+func (h *Handler) wakeAndWait(ctx context.Context, env *registry.Env) error {
 	waitCtx, cancel := context.WithTimeout(ctx, h.wakeTimeout)
 	defer cancel()
-	if err := h.power.EnsureAwake(waitCtx); err != nil {
+	if err := env.Power.EnsureAwake(waitCtx); err != nil {
 		return fmt.Errorf("ensure awake: %w", err)
 	}
-	if err := h.readiness.WaitForReady(waitCtx); err != nil {
+	if err := env.Readiness.WaitForReady(waitCtx); err != nil {
 		return fmt.Errorf("wait for ready: %w", err)
 	}
 	return nil

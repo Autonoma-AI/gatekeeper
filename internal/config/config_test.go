@@ -6,24 +6,38 @@ import (
 )
 
 func TestParseRoutes(t *testing.T) {
-	t.Run("valid", func(t *testing.T) {
-		routes, err := parseRoutes(`{"WEB.example.test":{"service":"web","port":3000}}`)
+	t.Run("valid with defaulted namespace", func(t *testing.T) {
+		routes, err := parseRoutes(`{"WEB.example.test":{"service":"web","port":3000}}`, "ns")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if up, ok := routes["web.example.test"]; !ok || up.Service != "web" || up.Port != 3000 {
+		up, ok := routes["web.example.test"]
+		if !ok || up.Service != "web" || up.Port != 3000 {
 			t.Fatalf("web route = %+v ok=%v", up, ok)
 		}
+		if up.Namespace != "ns" {
+			t.Fatalf("namespace = %q, want defaulted %q", up.Namespace, "ns")
+		}
 	})
-	for _, tt := range []struct{ name, raw string }{
-		{"empty", ""},
-		{"invalid json", `{nope}`},
-		{"empty service", `{"h":{"service":"","port":80}}`},
-		{"bad port", `{"h":{"service":"web","port":0}}`},
+	t.Run("explicit namespace wins over default", func(t *testing.T) {
+		routes, err := parseRoutes(`{"h":{"namespace":"other","service":"web","port":80}}`, "ns")
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got := routes["h"].Namespace; got != "other" {
+			t.Fatalf("namespace = %q, want %q", got, "other")
+		}
+	})
+	for _, tt := range []struct{ name, raw, defaultNS string }{
+		{"empty", "", "ns"},
+		{"invalid json", `{nope}`, "ns"},
+		{"empty service", `{"h":{"service":"","port":80}}`, "ns"},
+		{"bad port", `{"h":{"service":"web","port":0}}`, "ns"},
+		{"no namespace anywhere", `{"h":{"service":"web","port":80}}`, ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			if _, err := parseRoutes(tt.raw); err == nil {
-				t.Fatalf("parseRoutes(%q) expected an error", tt.raw)
+			if _, err := parseRoutes(tt.raw, tt.defaultNS); err == nil {
+				t.Fatalf("parseRoutes(%q, %q) expected an error", tt.raw, tt.defaultNS)
 			}
 		})
 	}
@@ -83,12 +97,32 @@ func TestLoadAuthEnabled(t *testing.T) {
 	}
 }
 
-func TestLoadRequiresNamespaceAndRoutes(t *testing.T) {
-	t.Run("missing namespace", func(t *testing.T) {
+func TestLoadNamespaceRequirements(t *testing.T) {
+	t.Run("route without namespace needs NAMESPACE", func(t *testing.T) {
 		t.Setenv("NAMESPACE", "")
 		t.Setenv("ROUTES_JSON", `{"web.example.test":{"service":"web","port":3000}}`)
 		if _, err := Load(); err == nil {
-			t.Fatal("expected error for missing NAMESPACE")
+			t.Fatal("expected error: route has no namespace and NAMESPACE is unset")
+		}
+	})
+	t.Run("per-route namespaces make NAMESPACE optional", func(t *testing.T) {
+		t.Setenv("NAMESPACE", "")
+		t.Setenv("POD_NAMESPACE", "system")
+		t.Setenv("ROUTES_JSON", `{"web.example.test":{"namespace":"ns-a","service":"web","port":3000}}`)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := cfg.Routes["web.example.test"].Namespace; got != "ns-a" {
+			t.Fatalf("route namespace = %q, want ns-a", got)
+		}
+	})
+	t.Run("without NAMESPACE, POD_NAMESPACE is required", func(t *testing.T) {
+		t.Setenv("NAMESPACE", "")
+		t.Setenv("POD_NAMESPACE", "")
+		t.Setenv("ROUTES_JSON", `{"web.example.test":{"namespace":"ns-a","service":"web","port":3000}}`)
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error: self-exclusion needs POD_NAMESPACE (or NAMESPACE)")
 		}
 	})
 	t.Run("missing routes", func(t *testing.T) {
@@ -96,6 +130,30 @@ func TestLoadRequiresNamespaceAndRoutes(t *testing.T) {
 		t.Setenv("ROUTES_JSON", "")
 		if _, err := Load(); err == nil {
 			t.Fatal("expected error for missing ROUTES_JSON")
+		}
+	})
+}
+
+func TestLoadPodNamespace(t *testing.T) {
+	t.Run("falls back to NAMESPACE", func(t *testing.T) {
+		setMinimalEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.PodNamespace != "ns" {
+			t.Fatalf("PodNamespace = %q, want fallback %q", cfg.PodNamespace, "ns")
+		}
+	})
+	t.Run("explicit POD_NAMESPACE wins", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("POD_NAMESPACE", "system")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.PodNamespace != "system" {
+			t.Fatalf("PodNamespace = %q, want %q", cfg.PodNamespace, "system")
 		}
 	})
 }
@@ -133,4 +191,22 @@ func TestLoadInvalidDuration(t *testing.T) {
 	if _, err := Load(); err == nil {
 		t.Fatal("expected error for invalid IDLE_TIMEOUT")
 	}
+}
+
+func TestIdleCheckInterval(t *testing.T) {
+	t.Run("zero interval with scale-to-zero enabled is a config error", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("IDLE_CHECK_INTERVAL", "0")
+		if _, err := Load(); err == nil {
+			t.Fatal("expected error: the idle loop cannot tick on a zero interval")
+		}
+	})
+	t.Run("zero interval is fine when scale-to-zero is disabled", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("IDLE_TIMEOUT", "0")
+		t.Setenv("IDLE_CHECK_INTERVAL", "0")
+		if _, err := Load(); err != nil {
+			t.Fatalf("Load: %v (IDLE_TIMEOUT=0 deployments may zero the interval too)", err)
+		}
+	})
 }

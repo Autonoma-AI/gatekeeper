@@ -82,8 +82,9 @@ All configuration is via environment variables.
 
 | Env | Default | Purpose |
 |-----|---------|---------|
-| `NAMESPACE` | *(required)* | Namespace Gatekeeper manages. Inject via the downward API. |
-| `ROUTES_JSON` | *(required)* | `{"host":{"service":"svc","port":80}, ...}` host -> upstream map. |
+| `NAMESPACE` | *(see below)* | Default namespace for routes that don't name one. Inject via the downward API. |
+| `ROUTES_JSON` | *(required)* | `{"host":{"service":"svc","port":80}, ...}` host -> upstream map. An entry may add `"namespace":"other-ns"` to route into (and manage) another namespace; entries without one use `NAMESPACE`. Required: every entry ends up with a namespace one way or the other. |
+| `POD_NAMESPACE` | *(falls back to `NAMESPACE`; required if `NAMESPACE` is unset)* | Namespace Gatekeeper itself runs in (downward API). `SELF_NAME` is only excluded from scaling here - a workload merely named the same elsewhere is managed normally. |
 | `PORT` | `8080` | Listen port. |
 | `HEALTH_PATH` | `/healthz` | Unauthenticated health/probe path. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. JSON logs to stdout. |
@@ -97,7 +98,7 @@ All configuration is via environment variables.
 | `WAKE_REPLICAS_ANNOTATION` | `gatekeeper.dev/wake-replicas` | Annotation storing the pre-sleep replica count. |
 | `DEPENDS_ON_ANNOTATION` | `gatekeeper.dev/depends-on` | Annotation (comma-separated workload names) declaring a workload's dependencies. Wake happens in dependency order: a workload's dependencies are scaled up and ready before it is. Deps naming an unmanaged workload are ignored; a cycle falls back to waking all at once. |
 | `IDLE_TIMEOUT` | `30m` | Idle duration before scaling to zero (Go duration). Set to `0` to disable scale-to-zero: the namespace is never auto-slept, but requests still wake one that is already asleep. |
-| `IDLE_CHECK_INTERVAL` | `30s` | How often idleness is checked. |
+| `IDLE_CHECK_INTERVAL` | `30s` | How often idleness is checked. Must be > 0 while scale-to-zero is enabled. |
 | `WAKE_TIMEOUT` | `5m` | Backstop for how long a request is held while the namespace wakes (all managed workloads become ready) before giving up (503 + `Retry-After`). Generous so slow-but-healthy starts (large image pulls, cold nodes) aren't cut off; a wake that hits a wedged pod fails fast well before this. |
 
 ### Two settings that must line up
