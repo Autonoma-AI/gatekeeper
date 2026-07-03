@@ -121,8 +121,11 @@ loop - the rest are warm standbys. Traffic is steered by a **pod label**
 (`gatekeeper.dev/role=leader`) that the leader sets on itself and the Service
 selects on; readiness stays uniform across replicas on purpose, since a
 Deployment with permanently-unready standbys could never complete a rollout.
-If the leader dies, a standby acquires the Lease (up to ~15s), labels itself,
-and re-derives all sleep/wake state from the cluster. Don't add a
+If the leader dies, a standby acquires the Lease (up to ~15s), re-derives all
+sleep/wake state from the cluster, and only then labels itself. Any replica
+that isn't the seeded leader answers proxied requests with 503 + `Retry-After`
+(probes and the auth callback are served everywhere), so a pod restarted with
+a stale leader label can never serve off wrong state. Don't add a
 PodDisruptionBudget: with one traffic-carrying pod it can only do nothing or
 block node drains - failover *is* the disruption tolerance.
 

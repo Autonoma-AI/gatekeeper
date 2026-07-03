@@ -88,27 +88,8 @@ func New(client kubernetes.Interface, namespace, leaseName, podName string, onLe
 		// immediately instead of waiting out the lease duration.
 		ReleaseOnCancel: true,
 		Callbacks: leaderelection.LeaderCallbacks{
-			OnStartedLeading: func(leadCtx context.Context) {
-				e.leading.Store(true)
-				e.log.Info("became leader")
-				// Seed state before taking traffic: requests must not be served
-				// off the default (assumed-awake) power state.
-				if e.onLead != nil {
-					e.onLead(leadCtx)
-				}
-				e.takeTraffic(leadCtx)
-			},
-			OnStoppedLeading: func() {
-				e.leading.Store(false)
-				// Losing the lease during shutdown is the ReleaseOnCancel path,
-				// not a failure; only an unexpected loss is signalled.
-				if e.rootCtx != nil && e.rootCtx.Err() != nil {
-					e.log.Info("released leadership on shutdown")
-					return
-				}
-				e.log.Warn("leadership lost")
-				close(e.lost)
-			},
+			OnStartedLeading: e.startLeading,
+			OnStoppedLeading: e.stopLeading,
 		},
 	})
 	if err != nil {
@@ -118,8 +99,40 @@ func New(client kubernetes.Interface, namespace, leaseName, podName string, onLe
 	return e, nil
 }
 
-// IsLeader reports whether this replica currently holds the lease.
+// IsLeader reports whether this replica holds the lease AND has finished
+// seeding (onLead). The serving gate and the idle loop key off it, so a
+// standby - or a freshly restarted pod still wearing a stale leader label -
+// fails closed instead of serving off default power state and aged idle
+// timers.
 func (e *Elector) IsLeader() bool { return e.leading.Load() }
+
+// startLeading orders a leadership acquisition: seed state, then open the
+// gate, then steer traffic here. A request must never arrive before onLead
+// has derived real power state, and the idle loop must never tick against a
+// standby's aged activity timers.
+func (e *Elector) startLeading(ctx context.Context) {
+	e.log.Info("became leader")
+	if e.onLead != nil {
+		e.onLead(ctx)
+	}
+	if ctx.Err() != nil {
+		return // leadership already ended mid-seed; the process is exiting
+	}
+	e.leading.Store(true)
+	e.takeTraffic(ctx)
+}
+
+func (e *Elector) stopLeading() {
+	e.leading.Store(false)
+	// Losing the lease during shutdown is the ReleaseOnCancel path, not a
+	// failure; only an unexpected loss is signalled.
+	if e.rootCtx != nil && e.rootCtx.Err() != nil {
+		e.log.Info("released leadership on shutdown")
+		return
+	}
+	e.log.Warn("leadership lost")
+	close(e.lost)
+}
 
 // Lost is closed if leadership is lost while the process is meant to keep
 // running; the caller should exit so the pod restarts as a standby. It is

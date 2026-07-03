@@ -95,3 +95,60 @@ func TestIsLeaderDefaultsFalse(t *testing.T) {
 		t.Fatal("IsLeader() = true before any election")
 	}
 }
+
+// Acquisition must seed state BEFORE the serving gate opens or traffic is
+// steered here: during onLead the replica is still not "leader" to the
+// handler and the idle loop, and the pod is not yet labeled.
+func TestStartLeadingSeedsBeforeServingAndLabeling(t *testing.T) {
+	client := fake.NewSimpleClientset(pod("gk-a", false))
+	var e *Elector
+	seeded := false
+	onLead := func(context.Context) {
+		seeded = true
+		if e.IsLeader() {
+			t.Error("IsLeader() = true during seeding; the gate must open after onLead")
+		}
+		if _, ok := roleLabel(t, client, "gk-a"); ok {
+			t.Error("pod labeled before seeding finished; traffic could reach unseeded state")
+		}
+	}
+	var err error
+	e, err = New(client, testNS, "gatekeeper", "gk-a", onLead, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	e.startLeading(context.Background())
+
+	if !seeded {
+		t.Fatal("onLead was not called")
+	}
+	if !e.IsLeader() {
+		t.Fatal("IsLeader() = false after startLeading")
+	}
+	if v, ok := roleLabel(t, client, "gk-a"); !ok || v != RoleLabelLeader {
+		t.Fatalf("role label = %q ok=%v, want leader after startLeading", v, ok)
+	}
+}
+
+// Leadership ending mid-seed must not open the serving gate: the process is
+// already on its way out and must not attract traffic first.
+func TestStartLeadingAbortsWhenLeadershipEndsMidSeed(t *testing.T) {
+	client := fake.NewSimpleClientset(pod("gk-a", false))
+	ctx, cancel := context.WithCancel(context.Background())
+	var e *Elector
+	var err error
+	e, err = New(client, testNS, "gatekeeper", "gk-a", func(context.Context) { cancel() }, testLogger())
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	e.startLeading(ctx)
+
+	if e.IsLeader() {
+		t.Fatal("IsLeader() = true although leadership ended during seeding")
+	}
+	if _, ok := roleLabel(t, client, "gk-a"); ok {
+		t.Fatal("pod labeled although leadership ended during seeding")
+	}
+}

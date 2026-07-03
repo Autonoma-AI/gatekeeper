@@ -50,7 +50,7 @@ func handlerWith(gate *auth.Gate, pw *fakePower, rd *fakeReadiness, act *fakeAct
 	reg.Rebuild(map[string]routing.Upstream{
 		testHost: {Namespace: "test-ns", Service: "web", Port: 3000},
 	})
-	return NewHandler(reg, gate, "<html>callback</html>", "/_gatekeeper/auth", "/healthz", "/readyz", nil, 2*time.Second, testLogger())
+	return NewHandler(reg, gate, "<html>callback</html>", "/_gatekeeper/auth", "/healthz", "/readyz", nil, nil, 2*time.Second, testLogger())
 }
 
 func enabledGate(loginURL string) *auth.Gate {
@@ -82,7 +82,7 @@ func TestAuthCallbackPathServesPageUnauthenticated(t *testing.T) {
 func TestReadyPathFollowsGate(t *testing.T) {
 	ready := true
 	reg := registry.New(func(ns string) *registry.Env { return &registry.Env{Namespace: ns} })
-	h := NewHandler(reg, enabledGate(""), "", "/_gatekeeper/auth", "/healthz", "/readyz", func() bool { return ready }, time.Second, testLogger())
+	h := NewHandler(reg, enabledGate(""), "", "/_gatekeeper/auth", "/healthz", "/readyz", func() bool { return ready }, nil, time.Second, testLogger())
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/readyz", nil))
@@ -95,6 +95,50 @@ func TestReadyPathFollowsGate(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/readyz", nil))
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("not-ready readyz = %d, want 503", rec.Code)
+	}
+}
+
+// A replica that may not serve (standby, or a restarted pod still wearing a
+// stale leader label) fails closed on proxied paths but keeps answering
+// probes, so kubelet never restarts a healthy standby.
+func TestStandbyFailsClosed(t *testing.T) {
+	serving := false
+	act := &fakeActivity{}
+	reg := registry.New(func(ns string) *registry.Env {
+		return &registry.Env{Namespace: ns, Power: &fakePower{}, Readiness: &fakeReadiness{}, Activity: act}
+	})
+	reg.Rebuild(map[string]routing.Upstream{testHost: {Namespace: "test-ns", Service: "web", Port: 3000}})
+	h := NewHandler(reg, disabledGate(), "", "/_gatekeeper/auth", "/healthz", "/readyz", nil,
+		func() bool { return serving }, time.Second, testLogger())
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/", nil))
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("standby proxied request = %d (Retry-After %q), want 503 with Retry-After",
+			rec.Code, rec.Header().Get("Retry-After"))
+	}
+	if act.calls != 0 {
+		t.Fatalf("standby recorded activity: %d touches, want 0", act.calls)
+	}
+
+	for _, path := range []string{"/healthz", "/readyz"} {
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+path, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("standby %s = %d, want 200", path, rec.Code)
+		}
+	}
+
+	serving = true
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/", nil).WithContext(ctx))
+	if rec.Code == http.StatusServiceUnavailable && rec.Header().Get("Retry-After") == "2" {
+		t.Fatal("serving replica still fails closed")
+	}
+	if act.calls != 1 {
+		t.Fatalf("serving replica touches = %d, want 1", act.calls)
 	}
 }
 

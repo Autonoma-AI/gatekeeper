@@ -106,9 +106,13 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// seed derives each namespace's awake/asleep state from the cluster.
-	// Best-effort: on failure we assume awake and reconcile on the first
-	// request / idle tick.
+	// seed derives each namespace's awake/asleep state from the cluster and
+	// resets its idle timer. Power state is best-effort: on failure we assume
+	// awake and reconcile on the first request / idle tick. The Touch matters
+	// on leadership acquisition: a standby's trackers aged without traffic,
+	// and must not sleep namespaces the previous leader was serving seconds
+	// ago - the cost is one extra idle timeout of awake time, same as any
+	// restart.
 	seed := func(parent context.Context) {
 		initCtx, cancelInit := context.WithTimeout(parent, initStateTimeout)
 		defer cancelInit()
@@ -117,6 +121,7 @@ func run() error {
 				log.Warn("could not determine initial power state; assuming awake",
 					"namespace", env.Namespace, "err", err)
 			}
+			env.Activity.Touch()
 		}
 	}
 
@@ -140,7 +145,9 @@ func run() error {
 		seed(ctx)
 	}
 
-	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.ReadyPath, nil, cfg.WakeTimeout, log)
+	// leading doubles as the serving gate: with leader election, proxied
+	// traffic fails closed on any replica that is not the seeded leader.
+	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.ReadyPath, nil, leading, cfg.WakeTimeout, log)
 
 	// With scale-to-zero disabled every Env's idle timeout is 0, so the loop
 	// could never sleep anything; don't start it (this also keeps the legacy
