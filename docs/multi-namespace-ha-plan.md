@@ -1,6 +1,9 @@
 # Multi-namespace + HA implementation plan
 
-Status: draft for review — 2026-07-03
+Status: implemented — PR 1 (registry), PR 2 (leader election + label steering),
+PR 3 (namespace discovery), PR 4 (docs + previewkit migration). Kept for the
+design rationale; operational docs live in the README and
+[migration-previewkit.md](migration-previewkit.md).
 
 Gatekeeper today is one controller per namespace: previewkit stamps a full
 gatekeeper (Deployment, SA, Role, routes ConfigMap) into every `preview-*`
