@@ -187,9 +187,13 @@ Rules worth knowing:
   unaffected.
 - If two namespaces claim the same host, the **oldest namespace wins**,
   deterministically; the loser gets an Event.
-- `GET /_gatekeeper/routes` (authenticated when auth is on) returns the live
-  routing table and each namespace's awake/asleep state - the discovery-mode
-  replacement for eyeballing a routes ConfigMap.
+- `GET /_gatekeeper/routes` returns the live routing table and each
+  namespace's awake/asleep state - the discovery-mode replacement for
+  eyeballing a routes ConfigMap. It requires authentication and therefore
+  **only exists while `AUTH_TOKEN` is set**: the table enumerates every
+  hostname, which may be your deployment's only secret (e.g. public previews
+  behind unguessable hostnames). With auth off the path is not intercepted at
+  all; inspect the namespace labels/annotations instead.
 - RBAC: add cluster-wide `namespaces get,list,watch` and `events create,patch`
   (included in `deploy/cluster/rbac.yaml`).
 

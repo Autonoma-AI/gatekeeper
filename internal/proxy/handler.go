@@ -34,7 +34,11 @@ type Resolver interface {
 // routesStatusPath serves the live routing table + per-namespace power state
 // as JSON. Unlike the health/ready paths it sits behind the auth gate: it is
 // an operator debug surface, needed because discovery mode has no single
-// config object to inspect.
+// config object to inspect. It exists ONLY while authentication is enabled -
+// with auth off there is nothing to gate it with, and the table enumerates
+// every hostname, which may be the deployment's only secret (e.g. previews
+// behind unguessable HMAC hostnames). Auth-off installs treat the path like
+// any other: it proxies to the routed app.
 const routesStatusPath = "/_gatekeeper/routes"
 
 // Handler implements http.Handler for all traffic across the managed namespaces.
@@ -121,9 +125,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 2b. Live routing table for operators - authenticated, but served by
-	//     every replica (standbys keep a warm informer cache worth inspecting).
-	if r.URL.Path == routesStatusPath {
+	// 2b. Live routing table for operators - authenticated, and only existing
+	//     at all when auth is enabled (see routesStatusPath). Served by every
+	//     replica (standbys keep a warm informer cache worth inspecting).
+	if r.URL.Path == routesStatusPath && h.gate.Enabled() {
 		if !h.gate.Authorized(r) {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return

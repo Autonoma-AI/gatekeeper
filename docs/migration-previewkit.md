@@ -128,9 +128,12 @@ no forced timeline.
 kubectl -n system get pods -l gatekeeper.dev/role=leader
 kubectl -n system get pods -o wide            # all 3 Ready (readiness = cache sync)
 
-# What does gatekeeper think it routes? (auth header only if AUTH_TOKEN is set)
-kubectl -n system port-forward svc/gatekeeper 8080:80 &
-curl -s -H "X-Gatekeeper-Token: $TOKEN" localhost:8080/_gatekeeper/routes | jq
+# What does gatekeeper think it routes? The /_gatekeeper/routes endpoint only
+# exists when AUTH_TOKEN is set (otherwise it would enumerate every preview's
+# secret hostname). Previews run auth-off, so inspect the source of truth -
+# the namespace annotations - directly:
+kubectl get ns -l gatekeeper.dev/managed=true \
+  -o custom-columns='NS:.metadata.name,ROUTES:.metadata.annotations.gatekeeper\.dev/routes'
 
 # Why is a namespace not managed? Bad annotations surface as Events:
 kubectl get events -n default --field-selector reason=InvalidRoutes
@@ -145,5 +148,5 @@ Failure modes worth knowing while operating:
   API-server trouble); check the Lease: `kubectl -n system get lease gatekeeper`.
 - **Leader failover** drops websockets and resets idle timers (namespaces stay
   awake up to one extra idle timeout) - by design, bounded, self-healing.
-- **A preview never sleeps** → check a per-namespace
-  `gatekeeper.dev/idle-timeout: "0"` override via `/_gatekeeper/routes`.
+- **A preview never sleeps** → check for a per-namespace
+  `gatekeeper.dev/idle-timeout: "0"` override on the Namespace annotations.
