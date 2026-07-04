@@ -112,6 +112,16 @@ else
   fail "discovery routing"
 fi
 
+echo "==> 2b. routes debug endpoint does not exist with auth off"
+# The enumeration attack shape: no known hostname, probing the debug path.
+# Auth is off in this suite, so the path must NOT serve the routing table.
+code=$(curl -s -o /tmp/gk-routes.out -w '%{http_code}' -H "Host: unknown.example.test" "$base/_gatekeeper/routes")
+if [ "$code" = "404" ] && ! grep -q idleTimeout /tmp/gk-routes.out; then
+  pass "auth-off /_gatekeeper/routes leaks nothing (404)"
+else
+  fail "auth-off /_gatekeeper/routes must not serve the table (http=$code)"
+fi
+
 echo "==> 3. a namespace with a malformed annotation is skipped, not fatal"
 k create ns "$NSC" >/dev/null 2>&1 || true
 k label ns "$NSC" gatekeeper.dev/managed=true --overwrite >/dev/null

@@ -126,6 +126,36 @@ func TestRoutesStatusEndpoint(t *testing.T) {
 	}
 }
 
+// With auth disabled the routes endpoint must not exist: the table enumerates
+// every hostname, and deployments like public previews rely on unguessable
+// hostnames as their only secret. The path falls through to normal proxying.
+func TestRoutesStatusRequiresAuthEnabled(t *testing.T) {
+	act := &fakeActivity{}
+	h := handlerWith(disabledGate(), &fakePower{}, &fakeReadiness{}, act)
+
+	// Known host: proxied like any other request (upstream unreachable in
+	// tests), never answered with the routing table.
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "http://"+testHost+"/_gatekeeper/routes", nil).WithContext(ctx)
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK || strings.Contains(rec.Body.String(), `"idleTimeout"`) {
+		t.Fatalf("auth-off routes request must not serve the table (got %d %q)", rec.Code, rec.Body.String())
+	}
+	if act.calls != 1 {
+		t.Fatalf("fall-through must behave like normal traffic: touches = %d, want 1", act.calls)
+	}
+
+	// Unknown host (the enumeration attack shape: the attacker knows no
+	// hostname): a plain 404, not the table.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://nope.example.test/_gatekeeper/routes", nil))
+	if rec.Code != http.StatusNotFound || strings.Contains(rec.Body.String(), `"idleTimeout"`) {
+		t.Fatalf("unknown-host routes request = %d %q, want plain 404", rec.Code, rec.Body.String())
+	}
+}
+
 // A replica that may not serve (standby, or a restarted pod still wearing a
 // stale leader label) fails closed on proxied paths but keeps answering
 // probes, so kubelet never restarts a healthy standby.
