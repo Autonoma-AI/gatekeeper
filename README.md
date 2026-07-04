@@ -1,10 +1,19 @@
 # Gatekeeper
 
-Gatekeeper is a tiny per-namespace reverse proxy for Kubernetes that **scales your
-workloads to zero when they are idle and wakes them on the next request** - holding
-that request until the backend is ready, so the caller sees a slightly slow first
-response instead of an error. It can optionally **authenticate** every request with
-a shared token.
+Gatekeeper is a tiny reverse proxy for Kubernetes that **scales your workloads
+to zero when they are idle and wakes them on the next request** - holding that
+request until the backend is ready, so the caller sees a slightly slow first
+response instead of an error. It can optionally **authenticate** every request
+with a shared token.
+
+It runs in two shapes:
+
+- **Single-namespace** (`deploy/`): one Gatekeeper inside the namespace it
+  manages, configured with a static `ROUTES_JSON`. The simple path.
+- **Cluster mode** (`deploy/cluster/`): one 3-replica install (leader-elected,
+  see [High availability](#high-availability-optional)) managing many
+  namespaces, [discovering](#namespace-discovery-optional) them by label with
+  routes in namespace annotations. Namespaces sleep and wake independently.
 
 It ships as a single ~25 MB static binary on distroless, uses tens of MB of RAM,
 starts instantly, and talks to the Kubernetes API with its own in-cluster
@@ -212,7 +221,11 @@ must carry the token.
 
 ## RBAC
 
-Gatekeeper runs as its own ServiceAccount and needs a namespaced Role:
+**Cluster mode** needs the ClusterRole (workloads + namespaces + events across
+managed namespaces) and the leader Role (leases, pod labeling) from
+`deploy/cluster/rbac.yaml`; the namespace-annotation design keeps the
+cluster-wide reads to Namespaces only. **Single-namespace mode** runs as its
+own ServiceAccount with just a namespaced Role:
 
 ```yaml
 rules:
@@ -251,10 +264,15 @@ crash loop) instead of waiting out `WAKE_TIMEOUT`. `deploy/` contains the full s
 ## Develop
 
 ```sh
-make all      # gofmt check + vet + test + build
-make docker   # build the container image
-./e2e/run.sh  # end-to-end test on a local cluster (OrbStack / kind / docker-desktop)
+make all              # gofmt check + vet + test + build
+make docker           # build the container image
+./e2e/run.sh          # e2e: single-namespace mode (static routes, auth, sleep/wake)
+./e2e/run-cluster.sh  # e2e: cluster mode (discovery, leader failover, isolation)
 ```
+
+Both e2e suites target a local cluster (OrbStack / kind / docker-desktop) and
+refuse anything else. Migrating a fleet of per-namespace installs to cluster
+mode? See [docs/migration-previewkit.md](docs/migration-previewkit.md).
 
 Go 1.26+. The module is `github.com/autonoma-ai/gatekeeper`.
 

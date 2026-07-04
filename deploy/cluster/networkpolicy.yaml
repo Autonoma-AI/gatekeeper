@@ -1,0 +1,52 @@
+# Network policies for cluster mode. Only needed when your CNI enforces
+# NetworkPolicy (AWS VPC CNI aws-node, Calico, Cilium, ...) and the namespaces
+# involved run default-deny policies.
+#
+# 1) API-server egress for the Gatekeeper pods (same caveats as the
+#    single-namespace deploy/networkpolicy-apiserver-egress.yaml: an `except`-
+#    bearing broad egress policy that also selects these pods shadows this
+#    allow on the AWS VPC CNI; on Cilium prefer a CiliumNetworkPolicy with
+#    toEntities: [kube-apiserver]).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-gatekeeper-apiserver-egress
+  namespace: system
+spec:
+  podSelector:
+    matchLabels:
+      app: gatekeeper
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+      ports:
+        - protocol: TCP
+          port: 443
+        - protocol: TCP
+          port: 6443
+---
+# 2) EXAMPLE for each MANAGED namespace (not applied here - stamp it into the
+#    preview namespaces alongside the label/annotation): with default-deny
+#    ingress, the apps must accept traffic from Gatekeeper, which now proxies
+#    from the "system" namespace instead of from inside the preview namespace.
+#    Symptom when missing: requests to that preview time out at the proxy while
+#    everything else looks healthy.
+#
+# apiVersion: networking.k8s.io/v1
+# kind: NetworkPolicy
+# metadata:
+#   name: allow-gatekeeper-ingress
+#   namespace: <preview-namespace>
+# spec:
+#   podSelector: {}                # every pod Gatekeeper may proxy to
+#   policyTypes: ["Ingress"]
+#   ingress:
+#     - from:
+#         - namespaceSelector:
+#             matchLabels:
+#               kubernetes.io/metadata.name: system
+#           podSelector:
+#             matchLabels:
+#               app: gatekeeper
