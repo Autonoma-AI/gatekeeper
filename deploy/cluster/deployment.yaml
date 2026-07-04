@@ -50,12 +50,12 @@ spec:
                   fieldPath: metadata.namespace
             - name: LEADER_ELECTION
               value: "true"
-            # --- routing: every entry names its namespace ---
-            - name: ROUTES_JSON
-              valueFrom:
-                configMapKeyRef:
-                  name: gatekeeper-routes
-                  key: routes.json
+            # --- routing: discover namespaces by label, routes from their
+            # gatekeeper.dev/routes annotation (see README "Cluster mode").
+            # Static routing remains available instead: unset NAMESPACE_SELECTOR
+            # and provide ROUTES_JSON with per-entry namespaces.
+            - name: NAMESPACE_SELECTOR
+              value: "gatekeeper.dev/managed=true"
             # --- scale-to-zero (same knobs as single-namespace mode) ---
             - name: TARGET_SELECTOR
               value: "gatekeeper.dev/scale-to-zero=true"
@@ -90,15 +90,20 @@ spec:
             limits:
               memory: 128Mi
 ---
-# Example routes for cluster mode: every entry names its target namespace.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: gatekeeper-routes
-  namespace: system
-data:
-  routes.json: |
-    {
-      "app-pr12.example.com": { "namespace": "preview-pr-12", "service": "web", "port": 3000 },
-      "api-pr12.example.com": { "namespace": "preview-pr-12", "service": "api", "port": 8080 }
-    }
+# Example of what a MANAGED namespace looks like in discovery mode. Gatekeeper
+# finds it by the label and routes by the annotation; no central config object.
+# (Shown for reference - previews are stamped by your deployment tooling.)
+#
+# apiVersion: v1
+# kind: Namespace
+# metadata:
+#   name: preview-pr-12
+#   labels:
+#     gatekeeper.dev/managed: "true"          # must match NAMESPACE_SELECTOR
+#   annotations:
+#     gatekeeper.dev/routes: |
+#       {
+#         "app-pr12.example.com": { "service": "web", "port": 3000 },
+#         "api-pr12.example.com": { "service": "api", "port": 8080 }
+#       }
+#     gatekeeper.dev/idle-timeout: "45m"      # optional per-namespace override

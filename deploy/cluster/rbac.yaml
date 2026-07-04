@@ -29,6 +29,17 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["list"]
+  # namespaces: discovery mode watches the ones labeled NAMESPACE_SELECTOR.
+  # Deliberately the ONLY cluster-wide read besides workloads - routes live in
+  # namespace annotations precisely so no cluster-wide ConfigMap read is needed.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # events: bad route annotations and host collisions are surfaced as Events
+  # on the offending Namespace (patch: the recorder aggregates repeats).
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
