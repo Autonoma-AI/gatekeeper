@@ -54,8 +54,10 @@ subjects:
     name: gatekeeper
     namespace: system
 ---
-# Home-namespace permissions: the election Lease, and get/patch on pods so the
-# elected leader can label itself (the Service selects on that label).
+# Home-namespace permissions: the election Lease, and list/get/patch on pods so
+# the elected leader can find any stale-labeled predecessor and label itself
+# (the Service selects on that label). list is required by the take-traffic path
+# and kept here so home-namespace pod ops don't depend on the cluster-wide grant.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -67,7 +69,7 @@ rules:
     verbs: ["get", "create", "update"]
   - apiGroups: [""]
     resources: ["pods"]
-    verbs: ["get", "patch"]
+    verbs: ["get", "list", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
