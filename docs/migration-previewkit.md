@@ -6,19 +6,33 @@ namespace. Cluster mode replaces all of that with **one Gatekeeper install**
 (namespace `system`, 3 replicas, leader election) that **discovers** preview
 namespaces by label and routes by annotation.
 
-Because routing is per-host at the ingress, the migration is **incremental and
-per-preview**: old and new Gatekeepers coexist, each preview cuts over (and can
-roll back) independently, and nothing needs a flag day.
+The central Gatekeeper sits behind **one wildcard Ingress**,
+`*.preview.autonoma.app` → `gatekeeper.system.svc`. Existing previews keep
+their own **exact-host** Ingresses (`<pr>.preview.autonoma.app` → their
+in-namespace Gatekeeper) until they are cut over. nginx always prefers an
+exact host over the wildcard, so each preview flips the instant its exact-host
+Ingress is deleted and nginx falls through to the wildcard - nothing is
+"repointed". The migration is therefore **incremental**: old and new
+Gatekeepers coexist, each preview cuts over (and can roll back) independently,
+and nothing needs a flag day.
 
 ## 0. Prerequisites
 
-- Gatekeeper image with cluster mode (PRs #1-#3; any tag from this repo's main).
+- Gatekeeper image with cluster mode - any tag built from this repo's main
+  (leader election + label/annotation discovery).
 - Cluster-admin on the previewkit EKS cluster (ClusterRole/Binding creation).
 - Nothing else changes: workload labels (`gatekeeper.dev/scale-to-zero=true`),
   wake annotations, and dependency ordering behave exactly as before - the
   same code runs, scoped per namespace.
+- The previewkit-specific pieces - the wildcard Ingress and the
+  `migrate-existing-previews.sh` cutover script - live in the **agent repo**
+  under `deployment/previewkit/cluster/gatekeeper/`, because `deployment/` is
+  autonoma-internal. This repo ships only the generic cluster-mode manifests
+  (`deploy/cluster/`) and the Gatekeeper code.
 
-## 1. Deploy the central Gatekeeper (inert)
+## 1. Apply the central install manifests (inert)
+
+From this repo:
 
 ```sh
 kubectl apply -f deploy/cluster/
@@ -26,7 +40,9 @@ kubectl apply -f deploy/cluster/
 
 This creates namespace `system`, the 3-replica Deployment, the leader-selecting
 Service, RBAC, and the API-server-egress NetworkPolicy. It is **inert**: with no
-namespace labeled `gatekeeper.dev/managed=true`, it routes nothing.
+namespace labeled `gatekeeper.dev/managed=true`, it routes nothing, and every
+existing preview's exact-host Ingress still wins over the (not-yet-applied)
+wildcard.
 
 Verify before proceeding:
 
@@ -35,91 +51,123 @@ kubectl -n system rollout status deploy/gatekeeper          # 3/3 available
 kubectl -n system get pods -l gatekeeper.dev/role=leader    # exactly one
 ```
 
-## 2. previewkit template vNext
+## 2. Ship the previewkit cluster-mode change
 
-For each preview namespace, the template changes are:
+This is the deploy-path change in the agent repo. Two parts:
 
-**Add** to the Namespace object:
+**The wildcard Ingress** (one, in namespace `system`) routes any preview host
+that has no exact-host Ingress of its own to the central Gatekeeper:
 
 ```yaml
-metadata:
-  labels:
-    gatekeeper.dev/managed: "true"
-  annotations:
-    gatekeeper.dev/routes: |
-      { "<preview-host>": { "service": "<svc>", "port": <port> }, ... }
-    # optional: gatekeeper.dev/idle-timeout: "45m"
+# agent repo: deployment/previewkit/cluster/gatekeeper/ingress.yaml
+- host: "*.preview.autonoma.app"
+  http:
+    paths:
+      - { path: /, pathType: Prefix,
+          backend: { service: { name: gatekeeper, port: { number: 80 } } } }
 ```
 
-**Add** (only if preview namespaces run default-deny ingress) an
-ingress-allow from the central Gatekeeper - see the commented example in
-`deploy/cluster/networkpolicy.yaml`. The proxy now connects from the `system`
-namespace, not from inside the preview. *Symptom when missing: that preview's
-requests time out at the proxy while everything else looks healthy.*
+Applying it is safe at any point: existing previews still resolve to their own
+exact-host Ingresses (exact beats wildcard), so only brand-new vNext previews
+- which have no exact-host Ingress - fall through to central.
 
-**Change** the preview's Ingress/Gateway backends for its hosts to
-`gatekeeper.system.svc` (port 80).
+**previewkit template vNext.** For each new preview namespace, the template:
 
-**Stop stamping** the per-namespace Gatekeeper resources: Deployment,
-ServiceAccount, Role, RoleBinding, `gatekeeper-routes` ConfigMap, Service, and
-the per-namespace `allow-gatekeeper-apiserver-egress` NetworkPolicy.
+- **Adds** to the Namespace object:
+
+  ```yaml
+  metadata:
+    labels:
+      gatekeeper.dev/managed: "true"
+    annotations:
+      gatekeeper.dev/routes: |
+        { "<preview-host>": { "service": "<svc>", "port": <port> }, ... }
+      # optional: gatekeeper.dev/idle-timeout: "45m"
+  ```
+
+- **Adds** (only if preview namespaces run default-deny ingress) an
+  ingress-allow from the central Gatekeeper - see the commented example in
+  `deploy/cluster/networkpolicy.yaml`. The proxy now connects from the `system`
+  namespace, not from inside the preview. *Symptom when missing: that preview's
+  requests time out at the proxy while everything else looks healthy.*
+
+- **Stops creating** the per-app exact-host Ingress - the wildcard covers it.
+
+- **Stops stamping** the per-namespace Gatekeeper resources: Deployment,
+  ServiceAccount, Role, RoleBinding, `gatekeeper-routes` ConfigMap, Service, and
+  the per-namespace `allow-gatekeeper-apiserver-egress` NetworkPolicy.
 
 New previews created from vNext are handled by the central Gatekeeper from
 birth; nothing further to do for them.
 
-## 3. Cutting over existing previews
+## 3. Migrate existing previews
 
-Per preview, apply the same three changes - label+annotate the namespace,
-repoint the ingress, delete the old in-namespace Gatekeeper - with one hard
-rule:
+Previews created before vNext still have their exact-host Ingress and their old
+in-namespace Gatekeeper, so they are untouched by step 2. Cutting one over
+means doing three things **atomically**, per namespace:
 
-> **Repoint the ingress and delete the old Gatekeeper in the same step.**
-> A leftover in-namespace Gatekeeper receives no traffic once the ingress
-> moves, so after its idle timeout it will scale the namespace to zero while
-> the central Gatekeeper - which is serving that preview's traffic - still
-> believes it is awake. Requests then hang against a dead backend until the
-> central one's state self-corrects. Deleting the old Gatekeeper (or at
-> minimum setting its `IDLE_TIMEOUT=0` first) closes that window.
+1. **Handoff** - label + annotate the namespace so the central Gatekeeper
+   adopts it (and apply the ingress-allow NetworkPolicy if previews are
+   default-deny).
+2. **Cutover** - delete the preview's exact-host Ingress. nginx falls through
+   to the wildcard, so the host now resolves to the central Gatekeeper. No
+   backend is repointed and there is no unrouted window - the wildcard is
+   simply the next-best match.
+3. **Teardown** - delete the old in-namespace Gatekeeper.
 
-Suggested order per preview (script-friendly, ~seconds of proxy blip):
+Doing this by hand across a fleet is error-prone and, because of the race
+below, unsafe if the steps drift apart - so it is a script:
 
 ```sh
-NS=preview-acme-pr-12
-
-# 1. Hand the namespace to the central gatekeeper.
-kubectl annotate ns "$NS" gatekeeper.dev/routes="$(routes_json_for "$NS")"
-kubectl label ns "$NS" gatekeeper.dev/managed=true
-# (+ apply the ingress-allow NetworkPolicy if previews are default-deny)
-
-# 2. Atomically: repoint ingress + remove the old gatekeeper.
-kubectl -n "$NS" patch ingress preview --type=json -p "$(ingress_backend_patch)"
-kubectl -n "$NS" delete deploy/gatekeeper svc/gatekeeper cm/gatekeeper-routes \
-  sa/gatekeeper role/gatekeeper rolebinding/gatekeeper --ignore-not-found
-
-# 3. Verify.
-curl -fsS -H "Host: <preview-host>" http://<ingress> >/dev/null
+# Agent repo; deployment/ is autonoma-internal. Dry-run by default:
+deployment/previewkit/cluster/gatekeeper/migrate-existing-previews.sh
+# Execute once the printed plan looks right:
+deployment/previewkit/cluster/gatekeeper/migrate-existing-previews.sh --apply
 ```
 
-Both Gatekeepers managing the same namespace for the few seconds between step
-1 and step 2 is harmless: wake operations are idempotent, and neither sleeps
-an active namespace that fast.
+Run `--apply` **promptly** after step 2 ships, so the two Gatekeepers don't run
+split-brain over the fleet for long. Then **re-run it for stragglers** -
+previews created mid-rollout, or any that errored the first time. It is
+idempotent: already-migrated namespaces are skipped.
+
+> **Handoff, cutover, and teardown are one atomic unit per namespace.**
+> A leftover in-namespace Gatekeeper receives no traffic once its exact-host
+> Ingress is gone, so after its idle timeout it will scale the namespace to
+> zero while the central Gatekeeper - which is now serving that preview's
+> traffic - still believes it is awake. Requests then hang against a dead
+> backend until the central one's state self-corrects. The script tears the old
+> Gatekeeper down in the same step it cuts traffic over (at minimum it sets the
+> old `IDLE_TIMEOUT=0` first), closing that window. This dual-idle-loop race is
+> the whole reason the cutover is a script and not a runbook.
+
+Both Gatekeepers managing the same namespace for the few seconds between
+handoff and teardown is harmless: wake operations are idempotent, and neither
+sleeps an active namespace that fast.
 
 ## 4. Rollback (per preview)
 
-The reverse, same atomicity rule:
+The exact-host-beats-wildcard property makes this clean. Recreate the preview's
+exact-host Ingress (nginx immediately prefers it over the wildcard, so traffic
+returns to the namespace) and re-stamp the per-namespace Gatekeeper from the
+previous template - then drop the label so central lets go:
 
 ```sh
+# 1. restore the in-namespace path first: re-stamp the old gatekeeper + its
+#    exact-host Ingress (previous template)
+# 2. then hand it back:
 kubectl label ns "$NS" gatekeeper.dev/managed-        # central lets go instantly
-# re-stamp the old per-namespace gatekeeper resources (previous template)
-# repoint the ingress back to the in-namespace gatekeeper Service
 ```
+
+Same atomicity rule in reverse: restore the in-namespace Gatekeeper and its
+exact-host Ingress **before** removing the label, or the host briefly falls
+through to a central Gatekeeper that no longer manages it.
 
 ## 5. Cleanup
 
 Once every preview is on vNext and the old stamps are drained, previewkit can
-drop the per-namespace Gatekeeper resources from its template entirely. The
-single-namespace mode remains supported by this repo (`deploy/`), so there is
-no forced timeline.
+drop the per-namespace Gatekeeper resources from its template entirely, and the
+migration script can be retired. The single-namespace mode remains supported by
+this repo (`deploy/`), so there is no forced timeline.
 
 ## Verification & debugging
 
@@ -143,7 +191,9 @@ kubectl get events -n default --field-selector reason=HostCollision
 Failure modes worth knowing while operating:
 
 - **Preview times out through the proxy, others fine** → missing ingress-allow
-  NetworkPolicy in that preview namespace (step 2).
+  NetworkPolicy in that preview namespace.
+- **A migrated preview still hits the old backend** → its exact-host Ingress was
+  not deleted, so nginx still prefers it over the wildcard; re-run the script.
 - **All previews 503 with `Retry-After`** → no seeded leader (election churn or
   API-server trouble); check the Lease: `kubectl -n system get lease gatekeeper`.
 - **Leader failover** drops websockets and resets idle timers (namespaces stay
