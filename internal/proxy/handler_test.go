@@ -207,6 +207,18 @@ func TestUnknownHostIs404(t *testing.T) {
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
+	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "text/html") {
+		t.Fatalf("Content-Type = %q, want text/html", ct)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "404") {
+		t.Fatalf("body does not look like a 404 page: %q", body)
+	}
+	// The page must stay generic: naming the host (or "host" at all) would
+	// confirm to an enumerating client that hostnames are the secret.
+	if strings.Contains(strings.ToLower(body), "host") {
+		t.Fatalf("404 page mentions hosts: %q", body)
+	}
 }
 
 func TestAuthDisabledPassesThrough(t *testing.T) {

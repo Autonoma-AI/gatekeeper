@@ -41,6 +41,32 @@ type Resolver interface {
 // any other: it proxies to the routed app.
 const routesStatusPath = "/_gatekeeper/routes"
 
+// notFoundPage is served (with a 404) when no route matches the request's
+// Host. It is deliberately generic: it must not confirm to a probing client
+// that hostnames are what is being enumerated, and it must not leak that a
+// preview once existed here versus never did.
+const notFoundPage = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>404 Not Found</title>
+<style>
+body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#fafafa;color:#333}
+main{text-align:center;padding:2rem}
+h1{font-size:3rem;margin:0 0 .5rem}
+p{margin:0;color:#666}
+</style>
+</head>
+<body>
+<main>
+<h1>404</h1>
+<p>The page you are looking for does not exist.</p>
+</main>
+</body>
+</html>
+`
+
 // Handler implements http.Handler for all traffic across the managed namespaces.
 type Handler struct {
 	resolver     Resolver
@@ -152,7 +178,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	env, upstream, ok := h.resolver.Resolve(r.Host)
 	if !ok {
 		h.log.Warn("no route for host", "host", r.Host)
-		http.Error(w, "Unknown host", http.StatusNotFound)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, notFoundPage)
 		return
 	}
 
