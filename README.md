@@ -98,6 +98,8 @@ All configuration is via environment variables.
 | `HEALTH_PATH` | `/healthz` | Unauthenticated health/probe path. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. JSON logs to stdout. |
 
+One exception to "all configuration is via environment variables": if a file exists at `/etc/gatekeeper/404.html` (e.g. mounted from a ConfigMap) at startup, its content replaces the built-in generic page served (with a 404) when no route matches the request's `Host`. Nothing mounted there is not an error - it's the default for every deployment that doesn't opt in. Keep a custom page just as generic as the built-in one: it must not hint that hostnames are what an unauthenticated client is enumerating.
+
 ### Scale-to-zero
 
 | Env | Default | Purpose |

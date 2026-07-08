@@ -41,12 +41,40 @@ type Resolver interface {
 // any other: it proxies to the routed app.
 const routesStatusPath = "/_gatekeeper/routes"
 
+// defaultNotFoundPage is served (with a 404) when no route matches the
+// request's Host and no custom page is configured (NOT_FOUND_PAGE_FILE). It is
+// deliberately generic: it must not confirm to a probing client that hostnames
+// are what is being enumerated, and it must not leak that a preview once
+// existed here versus never did. A custom page should stay just as generic.
+const defaultNotFoundPage = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>404 Not Found</title>
+<style>
+body{font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#fafafa;color:#333}
+main{text-align:center;padding:2rem}
+h1{font-size:3rem;margin:0 0 .5rem}
+p{margin:0;color:#666}
+</style>
+</head>
+<body>
+<main>
+<h1>404</h1>
+<p>The page you are looking for does not exist.</p>
+</main>
+</body>
+</html>
+`
+
 // Handler implements http.Handler for all traffic across the managed namespaces.
 type Handler struct {
 	resolver     Resolver
 	gate         *auth.Gate
 	callbackHTML string
 	callbackPath string
+	notFoundHTML string
 	healthPath   string
 	readyPath    string
 	ready        func() bool
@@ -56,19 +84,21 @@ type Handler struct {
 	log          *slog.Logger
 }
 
-// NewHandler wires the request pipeline. ready gates the readiness endpoint
-// and serving gates all proxied traffic (nil = always); liveness (healthPath)
-// is unconditional. With leader election, serving is the leader check: a
-// standby - or a restarted pod still wearing a stale leader label - must fail
-// closed rather than serve off unseeded power state. The reverse proxy uses a
-// transport that retries dial-refused errors for the duration of the request
-// context, covering the gap between a backend becoming scheduled and actually
-// accepting connections.
+// NewHandler wires the request pipeline. notFoundHTML is the body for
+// unknown-host 404s (empty = the built-in generic page). ready gates the
+// readiness endpoint and serving gates all proxied traffic (nil = always);
+// liveness (healthPath) is unconditional. With leader election, serving is the
+// leader check: a standby - or a restarted pod still wearing a stale leader
+// label - must fail closed rather than serve off unseeded power state. The
+// reverse proxy uses a transport that retries dial-refused errors for the
+// duration of the request context, covering the gap between a backend becoming
+// scheduled and actually accepting connections.
 func NewHandler(
 	resolver Resolver,
 	gate *auth.Gate,
 	callbackHTML string,
 	callbackPath string,
+	notFoundHTML string,
 	healthPath string,
 	readyPath string,
 	ready func() bool,
@@ -76,12 +106,16 @@ func NewHandler(
 	wakeTimeout time.Duration,
 	log *slog.Logger,
 ) *Handler {
+	if notFoundHTML == "" {
+		notFoundHTML = defaultNotFoundPage
+	}
 	transport := &retryTransport{base: http.DefaultTransport}
 	return &Handler{
 		resolver:     resolver,
 		gate:         gate,
 		callbackHTML: callbackHTML,
 		callbackPath: callbackPath,
+		notFoundHTML: notFoundHTML,
 		healthPath:   healthPath,
 		readyPath:    readyPath,
 		ready:        ready,
@@ -152,7 +186,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	env, upstream, ok := h.resolver.Resolve(r.Host)
 	if !ok {
 		h.log.Warn("no route for host", "host", r.Host)
-		http.Error(w, "Unknown host", http.StatusNotFound)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, h.notFoundHTML)
 		return
 	}
 

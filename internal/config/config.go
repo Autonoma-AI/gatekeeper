@@ -15,6 +15,14 @@ import (
 	"github.com/autonoma-ai/gatekeeper/internal/routing"
 )
 
+// notFoundPagePath is the conventional mount point for a custom 404 page
+// (e.g. a ConfigMap volume). It is fixed rather than configurable so every
+// deployment can mount to the same path without also wiring an env var
+// through the stamping template. Its absence is not an error: most
+// deployments have nothing mounted there and get the built-in page. A var,
+// not a const, only so tests can point it at a temp file.
+var notFoundPagePath = "/etc/gatekeeper/404.html"
+
 // Config is the fully-validated runtime configuration.
 type Config struct {
 	Port int
@@ -79,6 +87,13 @@ type Config struct {
 	// the workloads a workload depends on. Gatekeeper wakes workloads in dependency
 	// order (dependencies first), so an app is not started before its database.
 	DependsOnAnnotation string
+
+	// NotFoundHTML is the body served (with a 404) when no route matches the
+	// request's Host - the content of notFoundPagePath, read once at startup
+	// if present. Empty (the default, when no file is mounted there) means the
+	// built-in generic page. Keep a custom page generic too: it must not
+	// confirm to a probing client that hostnames are what is being enumerated.
+	NotFoundHTML string
 
 	HealthPath string
 	// ReadyPath serves readiness, distinct from HealthPath (liveness) so that
@@ -154,6 +169,10 @@ func Load() (*Config, error) {
 
 	if cfg.PodNamespace = os.Getenv("POD_NAMESPACE"); cfg.PodNamespace == "" {
 		cfg.PodNamespace = cfg.Namespace
+	}
+
+	if cfg.NotFoundHTML, err = readOptionalFile(notFoundPagePath); err != nil {
+		return nil, err
 	}
 
 	if rawRoutes := os.Getenv("ROUTES_JSON"); cfg.DiscoveryEnabled() {
@@ -252,6 +271,22 @@ func boolEnv(key string, fallback bool) (bool, error) {
 		return false, fmt.Errorf("invalid boolean for %s (want e.g. \"true\", \"false\"): %w", key, err)
 	}
 	return b, nil
+}
+
+// readOptionalFile reads path if it exists. A missing file returns "" (no
+// error): the path is a fixed convention, not something an operator sets, so
+// most deployments will have nothing mounted there. Any other error (e.g.
+// permission denied) is a real misconfiguration of whatever *is* mounted and
+// fails startup rather than silently falling back.
+func readOptionalFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("cannot read %s: %w", path, err)
+	}
+	return string(b), nil
 }
 
 func durationEnv(key string, fallback time.Duration) (time.Duration, error) {

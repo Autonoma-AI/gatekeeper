@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -79,6 +81,60 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.WakeTimeout != 5*time.Minute {
 		t.Errorf("WakeTimeout default = %v, want 5m", cfg.WakeTimeout)
 	}
+}
+
+func TestLoadNotFoundPage(t *testing.T) {
+	// notFoundPagePath is a fixed convention, not an env var; point it at a
+	// temp file for the duration of each subtest and restore it after.
+	withNotFoundPagePath := func(t *testing.T, path string) {
+		t.Helper()
+		orig := notFoundPagePath
+		notFoundPagePath = path
+		t.Cleanup(func() { notFoundPagePath = orig })
+	}
+
+	t.Run("nothing mounted means built-in default", func(t *testing.T) {
+		setMinimalEnv(t)
+		withNotFoundPagePath(t, filepath.Join(t.TempDir(), "404.html"))
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.NotFoundHTML != "" {
+			t.Errorf("NotFoundHTML = %q, want empty (built-in default)", cfg.NotFoundHTML)
+		}
+	})
+
+	t.Run("reads file content when present", func(t *testing.T) {
+		setMinimalEnv(t)
+		path := filepath.Join(t.TempDir(), "404.html")
+		if err := os.WriteFile(path, []byte("<html>custom 404</html>"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		withNotFoundPagePath(t, path)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.NotFoundHTML != "<html>custom 404</html>" {
+			t.Errorf("NotFoundHTML = %q", cfg.NotFoundHTML)
+		}
+	})
+
+	// A file that exists but can't be read (e.g. bad permissions) is a real
+	// misconfiguration of whatever is mounted, and must fail startup rather
+	// than silently serving the default page.
+	t.Run("unreadable existing file is a hard error", func(t *testing.T) {
+		setMinimalEnv(t)
+		path := filepath.Join(t.TempDir(), "404.html")
+		if err := os.WriteFile(path, []byte("x"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		withNotFoundPagePath(t, path)
+		if _, err := Load(); err == nil {
+			t.Fatal("Load succeeded with an unreadable notFoundPagePath")
+		}
+	})
 }
 
 func TestLoadAuthEnabled(t *testing.T) {
