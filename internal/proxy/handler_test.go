@@ -51,7 +51,7 @@ func handlerWith(gate *auth.Gate, pw *fakePower, rd *fakeReadiness, act *fakeAct
 	reg.Rebuild(map[string]routing.Upstream{
 		testHost: {Namespace: "test-ns", Service: "web", Port: 3000},
 	}, nil)
-	return NewHandler(reg, gate, "<html>callback</html>", "/_gatekeeper/auth", "/healthz", "/readyz", nil, nil, 2*time.Second, testLogger())
+	return NewHandler(reg, gate, "<html>callback</html>", "/_gatekeeper/auth", "", "/healthz", "/readyz", nil, nil, 2*time.Second, testLogger())
 }
 
 func enabledGate(loginURL string) *auth.Gate {
@@ -83,7 +83,7 @@ func TestAuthCallbackPathServesPageUnauthenticated(t *testing.T) {
 func TestReadyPathFollowsGate(t *testing.T) {
 	ready := true
 	reg := registry.New(func(ns string) *registry.Env { return &registry.Env{Namespace: ns} })
-	h := NewHandler(reg, enabledGate(""), "", "/_gatekeeper/auth", "/healthz", "/readyz", func() bool { return ready }, nil, time.Second, testLogger())
+	h := NewHandler(reg, enabledGate(""), "", "/_gatekeeper/auth", "", "/healthz", "/readyz", func() bool { return ready }, nil, time.Second, testLogger())
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://"+testHost+"/readyz", nil))
@@ -166,7 +166,7 @@ func TestStandbyFailsClosed(t *testing.T) {
 		return &registry.Env{Namespace: ns, Power: &fakePower{}, Readiness: &fakeReadiness{}, Activity: act}
 	})
 	reg.Rebuild(map[string]routing.Upstream{testHost: {Namespace: "test-ns", Service: "web", Port: 3000}}, nil)
-	h := NewHandler(reg, disabledGate(), "", "/_gatekeeper/auth", "/healthz", "/readyz", nil,
+	h := NewHandler(reg, disabledGate(), "", "/_gatekeeper/auth", "", "/healthz", "/readyz", nil,
 		func() bool { return serving }, time.Second, testLogger())
 
 	rec := httptest.NewRecorder()
@@ -218,6 +218,19 @@ func TestUnknownHostIs404(t *testing.T) {
 	// confirm to an enumerating client that hostnames are the secret.
 	if strings.Contains(strings.ToLower(body), "host") {
 		t.Fatalf("404 page mentions hosts: %q", body)
+	}
+}
+
+func TestUnknownHostServesCustomPage(t *testing.T) {
+	reg := registry.New(func(ns string) *registry.Env { return &registry.Env{Namespace: ns} })
+	reg.Rebuild(map[string]routing.Upstream{testHost: {Namespace: "test-ns", Service: "web", Port: 3000}}, nil)
+	h := NewHandler(reg, disabledGate(), "", "/_gatekeeper/auth", "<html>custom 404</html>",
+		"/healthz", "/readyz", nil, nil, time.Second, testLogger())
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "http://nope.example.test/", nil))
+	if rec.Code != http.StatusNotFound || rec.Body.String() != "<html>custom 404</html>" {
+		t.Fatalf("custom 404 = %d %q", rec.Code, rec.Body.String())
 	}
 }
 

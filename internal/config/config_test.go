@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -79,6 +81,44 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.WakeTimeout != 5*time.Minute {
 		t.Errorf("WakeTimeout default = %v, want 5m", cfg.WakeTimeout)
 	}
+}
+
+func TestLoadNotFoundPageFile(t *testing.T) {
+	t.Run("unset means built-in default", func(t *testing.T) {
+		setMinimalEnv(t)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.NotFoundHTML != "" {
+			t.Errorf("NotFoundHTML = %q, want empty (built-in default)", cfg.NotFoundHTML)
+		}
+	})
+
+	t.Run("reads file content", func(t *testing.T) {
+		setMinimalEnv(t)
+		path := filepath.Join(t.TempDir(), "404.html")
+		if err := os.WriteFile(path, []byte("<html>custom 404</html>"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("NOT_FOUND_PAGE_FILE", path)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.NotFoundHTML != "<html>custom 404</html>" {
+			t.Errorf("NotFoundHTML = %q", cfg.NotFoundHTML)
+		}
+	})
+
+	// A typo'd path must fail startup, not silently serve the default page.
+	t.Run("unreadable file is a hard error", func(t *testing.T) {
+		setMinimalEnv(t)
+		t.Setenv("NOT_FOUND_PAGE_FILE", filepath.Join(t.TempDir(), "missing.html"))
+		if _, err := Load(); err == nil {
+			t.Fatal("Load succeeded with an unreadable NOT_FOUND_PAGE_FILE")
+		}
+	})
 }
 
 func TestLoadAuthEnabled(t *testing.T) {

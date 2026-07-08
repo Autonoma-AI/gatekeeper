@@ -201,7 +201,7 @@ func run() error {
 
 	// leading doubles as the serving gate: with leader election, proxied
 	// traffic fails closed on any replica that is not the seeded leader.
-	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.HealthPath, cfg.ReadyPath, ready, leading, cfg.WakeTimeout, log)
+	handler := proxy.NewHandler(reg, gate, callbackHTML, cfg.AuthCallbackPath, cfg.NotFoundHTML, cfg.HealthPath, cfg.ReadyPath, ready, leading, cfg.WakeTimeout, log)
 
 	// With scale-to-zero disabled every Env's idle timeout is 0, so the loop
 	// could never sleep anything; don't start it (this also keeps the legacy

@@ -80,6 +80,13 @@ type Config struct {
 	// order (dependencies first), so an app is not started before its database.
 	DependsOnAnnotation string
 
+	// NotFoundHTML is the body served (with a 404) when no route matches the
+	// request's Host - the content of NOT_FOUND_PAGE_FILE, read once at
+	// startup. Empty (the default) means the built-in generic page. Keep a
+	// custom page generic too: it must not confirm to a probing client that
+	// hostnames are what is being enumerated.
+	NotFoundHTML string
+
 	HealthPath string
 	// ReadyPath serves readiness, distinct from HealthPath (liveness) so that
 	// readiness can be gated (e.g. on discovery cache sync) without ever
@@ -154,6 +161,10 @@ func Load() (*Config, error) {
 
 	if cfg.PodNamespace = os.Getenv("POD_NAMESPACE"); cfg.PodNamespace == "" {
 		cfg.PodNamespace = cfg.Namespace
+	}
+
+	if cfg.NotFoundHTML, err = fileEnv("NOT_FOUND_PAGE_FILE"); err != nil {
+		return nil, err
 	}
 
 	if rawRoutes := os.Getenv("ROUTES_JSON"); cfg.DiscoveryEnabled() {
@@ -252,6 +263,22 @@ func boolEnv(key string, fallback bool) (bool, error) {
 		return false, fmt.Errorf("invalid boolean for %s (want e.g. \"true\", \"false\"): %w", key, err)
 	}
 	return b, nil
+}
+
+// fileEnv reads the file named by the env var. An unset var means "use the
+// built-in default" and returns ""; a set-but-unreadable file is a hard error,
+// because silently falling back would mask a typo'd path until someone notices
+// the wrong page in production.
+func fileEnv(key string) (string, error) {
+	path := os.Getenv(key)
+	if path == "" {
+		return "", nil
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("cannot read %s: %w", key, err)
+	}
+	return string(b), nil
 }
 
 func durationEnv(key string, fallback time.Duration) (time.Duration, error) {
