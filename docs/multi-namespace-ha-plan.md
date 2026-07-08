@@ -1,18 +1,18 @@
 # Multi-namespace + HA implementation plan
 
 Status: implemented — PR 1 (registry), PR 2 (leader election + label steering),
-PR 3 (namespace discovery), PR 4 (docs + previewkit migration). Kept for the
-design rationale; operational docs live in the README and
-[migration-previewkit.md](migration-previewkit.md).
+PR 3 (namespace discovery), PR 4 (docs). Kept for the design rationale;
+operational docs live in the README.
 
-Gatekeeper today is one controller per namespace: previewkit stamps a full
-gatekeeper (Deployment, SA, Role, routes ConfigMap) into every `preview-*`
-namespace. This plan consolidates that into a **single gatekeeper deployment
+Gatekeeper today is one controller per namespace: each `preview-*` namespace
+gets its own full gatekeeper (Deployment, SA, Role, routes ConfigMap) stamped
+into it. This plan consolidates that into a **single gatekeeper deployment
 that observes many namespaces**, discovers them dynamically, and runs
 **active-passive across 3 replicas**.
 
 Every phase keeps the current single-namespace mode working unchanged, so the
-existing per-namespace deployments stay valid until previewkit cuts over.
+existing per-namespace deployments stay valid until they're migrated to
+cluster mode.
 
 ## Decisions
 
@@ -20,7 +20,7 @@ existing per-namespace deployments stay valid until previewkit cuts over.
   logic (sleep/wake/readiness/idle) is instantiated per namespace.
 - **Config source: namespace discovery.** Namespaces opt in via a label;
   routes live in an annotation on the Namespace object. No central routes
-  ConfigMap (avoids previewkit read-modify-write races and stale-route GC).
+  ConfigMap (avoids read-modify-write races and stale-route GC).
   Watched with a single shared informer; the static `ROUTES_JSON` mode remains
   supported for single-namespace and e2e use.
 - **HA: active-passive, 3 replicas, Lease-based leader election**
@@ -87,7 +87,7 @@ type Registry struct {
 `Scaler`, `power.Manager`, and `activity.Tracker` need no internal changes;
 they are already per-namespace objects constructed once in `main.go`.
 
-## External contract (previewkit-facing)
+## External contract
 
 ```yaml
 # On each preview Namespace object:
@@ -255,18 +255,6 @@ as today with no Lease RBAC.
 
 - README: new "cluster mode" section, contract, RBAC, failover behavior;
   keep the single-namespace docs as the simple path.
-- Migration guide for previewkit (`docs/migration-previewkit.md`):
-  1. Deploy `deploy/cluster/` — inert until namespaces are labeled.
-  2. Template vNext: add label + routes annotation to the Namespace; point the
-     preview's ingress hosts at the central Service; add a NetworkPolicy
-     allowing ingress from `system` (previews are default-deny);
-     **stop stamping** the per-namespace gatekeeper resources.
-  3. Cut over per preview (routing is per-host, so this is incremental):
-     repoint ingress **and delete the old in-namespace gatekeeper in the same
-     step** — a leftover one receives no traffic, goes idle, and would sleep a
-     namespace the central gatekeeper believes is awake.
-  4. Rollback per preview is the reverse: repoint ingress, re-stamp the old
-     gatekeeper, unlabel the namespace.
 - The central gatekeeper's API-server-egress NetworkPolicy moves to
   `system` (one copy instead of N).
 
@@ -289,7 +277,7 @@ as today with no Lease RBAC.
 | Stale leader label after container crash | Startup label-clear; readiness fails while the process is down, pulling the pod from endpoints. |
 | Central blast radius (one deployment fronts all previews) | The point of the HA work; plus per-namespace error isolation in discovery. |
 | Leader restart bursts API calls (seeding N namespaces) | QPS/burst raise in PR 1. |
-| Previewkit skew during migration | Legacy mode fully supported; per-preview cutover with per-preview rollback. |
+| Caller skew during migration | Legacy mode fully supported; per-preview cutover with per-preview rollback. |
 | Missed netpol ingress-allow in a preview ns | Symptom is proxy timeouts to that ns only; add to migration checklist + README troubleshooting. |
 
 ## Out of scope (deliberate)

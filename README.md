@@ -277,8 +277,7 @@ make docker           # build the container image
 ```
 
 Both e2e suites target a local cluster (OrbStack / kind / docker-desktop) and
-refuse anything else. Migrating a fleet of per-namespace installs to cluster
-mode? See [docs/migration-previewkit.md](docs/migration-previewkit.md).
+refuse anything else.
 
 Go 1.26+. The module is `github.com/autonoma-ai/gatekeeper`.
 
