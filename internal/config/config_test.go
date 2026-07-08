@@ -83,9 +83,19 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadNotFoundPageFile(t *testing.T) {
-	t.Run("unset means built-in default", func(t *testing.T) {
+func TestLoadNotFoundPage(t *testing.T) {
+	// notFoundPagePath is a fixed convention, not an env var; point it at a
+	// temp file for the duration of each subtest and restore it after.
+	withNotFoundPagePath := func(t *testing.T, path string) {
+		t.Helper()
+		orig := notFoundPagePath
+		notFoundPagePath = path
+		t.Cleanup(func() { notFoundPagePath = orig })
+	}
+
+	t.Run("nothing mounted means built-in default", func(t *testing.T) {
 		setMinimalEnv(t)
+		withNotFoundPagePath(t, filepath.Join(t.TempDir(), "404.html"))
 		cfg, err := Load()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
@@ -95,13 +105,13 @@ func TestLoadNotFoundPageFile(t *testing.T) {
 		}
 	})
 
-	t.Run("reads file content", func(t *testing.T) {
+	t.Run("reads file content when present", func(t *testing.T) {
 		setMinimalEnv(t)
 		path := filepath.Join(t.TempDir(), "404.html")
 		if err := os.WriteFile(path, []byte("<html>custom 404</html>"), 0o600); err != nil {
 			t.Fatal(err)
 		}
-		t.Setenv("NOT_FOUND_PAGE_FILE", path)
+		withNotFoundPagePath(t, path)
 		cfg, err := Load()
 		if err != nil {
 			t.Fatalf("Load: %v", err)
@@ -111,12 +121,18 @@ func TestLoadNotFoundPageFile(t *testing.T) {
 		}
 	})
 
-	// A typo'd path must fail startup, not silently serve the default page.
-	t.Run("unreadable file is a hard error", func(t *testing.T) {
+	// A file that exists but can't be read (e.g. bad permissions) is a real
+	// misconfiguration of whatever is mounted, and must fail startup rather
+	// than silently serving the default page.
+	t.Run("unreadable existing file is a hard error", func(t *testing.T) {
 		setMinimalEnv(t)
-		t.Setenv("NOT_FOUND_PAGE_FILE", filepath.Join(t.TempDir(), "missing.html"))
+		path := filepath.Join(t.TempDir(), "404.html")
+		if err := os.WriteFile(path, []byte("x"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		withNotFoundPagePath(t, path)
 		if _, err := Load(); err == nil {
-			t.Fatal("Load succeeded with an unreadable NOT_FOUND_PAGE_FILE")
+			t.Fatal("Load succeeded with an unreadable notFoundPagePath")
 		}
 	})
 }

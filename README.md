@@ -96,8 +96,9 @@ All configuration is via environment variables.
 | `POD_NAMESPACE` | *(falls back to `NAMESPACE`; required if `NAMESPACE` is unset)* | Namespace Gatekeeper itself runs in (downward API). `SELF_NAME` is only excluded from scaling here - a workload merely named the same elsewhere is managed normally. |
 | `PORT` | `8080` | Listen port. |
 | `HEALTH_PATH` | `/healthz` | Unauthenticated health/probe path. |
-| `NOT_FOUND_PAGE_FILE` | *(built-in page)* | Path to an HTML file served (with a 404) when no route matches the request's `Host`. Read once at startup; an unreadable path fails startup. Keep the page generic - it must not hint that hostnames are what an unauthenticated client is enumerating. |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error`. JSON logs to stdout. |
+
+One exception to "all configuration is via environment variables": if a file exists at `/etc/gatekeeper/404.html` (e.g. mounted from a ConfigMap) at startup, its content replaces the built-in generic page served (with a 404) when no route matches the request's `Host`. Nothing mounted there is not an error - it's the default for every deployment that doesn't opt in. Keep a custom page just as generic as the built-in one: it must not hint that hostnames are what an unauthenticated client is enumerating.
 
 ### Scale-to-zero
 

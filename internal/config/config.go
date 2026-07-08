@@ -15,6 +15,14 @@ import (
 	"github.com/autonoma-ai/gatekeeper/internal/routing"
 )
 
+// notFoundPagePath is the conventional mount point for a custom 404 page
+// (e.g. a ConfigMap volume). It is fixed rather than configurable so every
+// deployment can mount to the same path without also wiring an env var
+// through the stamping template. Its absence is not an error: most
+// deployments have nothing mounted there and get the built-in page. A var,
+// not a const, only so tests can point it at a temp file.
+var notFoundPagePath = "/etc/gatekeeper/404.html"
+
 // Config is the fully-validated runtime configuration.
 type Config struct {
 	Port int
@@ -81,10 +89,10 @@ type Config struct {
 	DependsOnAnnotation string
 
 	// NotFoundHTML is the body served (with a 404) when no route matches the
-	// request's Host - the content of NOT_FOUND_PAGE_FILE, read once at
-	// startup. Empty (the default) means the built-in generic page. Keep a
-	// custom page generic too: it must not confirm to a probing client that
-	// hostnames are what is being enumerated.
+	// request's Host - the content of notFoundPagePath, read once at startup
+	// if present. Empty (the default, when no file is mounted there) means the
+	// built-in generic page. Keep a custom page generic too: it must not
+	// confirm to a probing client that hostnames are what is being enumerated.
 	NotFoundHTML string
 
 	HealthPath string
@@ -163,7 +171,7 @@ func Load() (*Config, error) {
 		cfg.PodNamespace = cfg.Namespace
 	}
 
-	if cfg.NotFoundHTML, err = fileEnv("NOT_FOUND_PAGE_FILE"); err != nil {
+	if cfg.NotFoundHTML, err = readOptionalFile(notFoundPagePath); err != nil {
 		return nil, err
 	}
 
@@ -265,18 +273,18 @@ func boolEnv(key string, fallback bool) (bool, error) {
 	return b, nil
 }
 
-// fileEnv reads the file named by the env var. An unset var means "use the
-// built-in default" and returns ""; a set-but-unreadable file is a hard error,
-// because silently falling back would mask a typo'd path until someone notices
-// the wrong page in production.
-func fileEnv(key string) (string, error) {
-	path := os.Getenv(key)
-	if path == "" {
+// readOptionalFile reads path if it exists. A missing file returns "" (no
+// error): the path is a fixed convention, not something an operator sets, so
+// most deployments will have nothing mounted there. Any other error (e.g.
+// permission denied) is a real misconfiguration of whatever *is* mounted and
+// fails startup rather than silently falling back.
+func readOptionalFile(path string) (string, error) {
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
 		return "", nil
 	}
-	b, err := os.ReadFile(path)
 	if err != nil {
-		return "", fmt.Errorf("cannot read %s: %w", key, err)
+		return "", fmt.Errorf("cannot read %s: %w", path, err)
 	}
 	return string(b), nil
 }
